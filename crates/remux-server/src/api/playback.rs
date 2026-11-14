@@ -2836,6 +2836,8 @@ mod tests {
             subtitle_extraction: false,
             probe_on_scan: false,
             service_filter: vec![],
+            trickplay: true,
+            trickplay_service_filter: vec![],
             created_at: now,
             updated_at: now,
         };
@@ -2921,6 +2923,8 @@ mod tests {
             subtitle_extraction: false,
             probe_on_scan: false,
             service_filter: vec![],
+            trickplay: true,
+            trickplay_service_filter: vec![],
             created_at: now,
             updated_at: now,
         };
@@ -5882,6 +5886,8 @@ mod tests {
             subtitle_extraction: true,
             probe_on_scan: false,
             service_filter: vec![],
+            trickplay: true,
+            trickplay_service_filter: vec![],
             created_at: now,
             updated_at: now,
         };

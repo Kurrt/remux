@@ -177,6 +177,8 @@ fn addon_to_dto(addon: Addon, addons: &AddonService) -> AddonDto {
         subtitle_extraction: addon.subtitle_extraction,
         probe_on_scan: addon.probe_on_scan,
         service_filter: addon.service_filter,
+        trickplay: addon.trickplay,
+        trickplay_service_filter: addon.trickplay_service_filter,
         description: preset.map(|p| {
             p.metadata()
                 .description
@@ -346,6 +348,8 @@ pub async fn create_addon(
         subtitle_extraction: false,
         probe_on_scan: false,
         service_filter: vec![],
+        trickplay: true,
+        trickplay_service_filter: vec![],
     };
 
     addon
@@ -367,6 +371,7 @@ pub async fn create_addon(
                 .config,
         )
         .await?;
+    crate::trickplay::refresh_addon_rules(&state.ctx).await;
     Ok((
         StatusCode::CREATED,
         Json(addon_to_dto(
@@ -398,6 +403,8 @@ pub async fn update_addon(
         subtitle_extraction,
         probe_on_scan,
         service_filter,
+        trickplay,
+        trickplay_service_filter,
     } = payload;
     let mut addon = Addon::get(
         &state
@@ -456,6 +463,12 @@ pub async fn update_addon(
     }
     if let Some(service_filter) = service_filter {
         addon.service_filter = service_filter;
+    }
+    if let Some(trickplay) = trickplay {
+        addon.trickplay = trickplay;
+    }
+    if let Some(trickplay_service_filter) = trickplay_service_filter {
+        addon.trickplay_service_filter = trickplay_service_filter;
     }
     addon.updated_at = Utc::now().naive_utc();
 
@@ -544,6 +557,7 @@ pub async fn update_addon(
                 .config,
         )
         .await?;
+    crate::trickplay::refresh_addon_rules(&state.ctx).await;
     Ok(Json(addon_to_dto(
         addon,
         &state
@@ -608,6 +622,7 @@ pub async fn delete_addon(
                 .config,
         )
         .await?;
+    crate::trickplay::refresh_addon_rules(&state.ctx).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -970,6 +985,105 @@ mod test {
     }
 
     #[tokio::test]
+    async fn trickplay_switch_and_service_filter_roundtrip() {
+        let (server, ctx, token) = authenticated_server().await;
+        let (h, v) = auth(&token);
+        let dir = std::env::temp_dir()
+            .to_string_lossy()
+            .to_string();
+
+        let created: AddonDto = server
+            .post("/addons")
+            .add_header(h.clone(), v.clone())
+            .json(&json!({
+                "preset": {
+                    "kind": "opendal-local",
+                    "config": { "paths": [dir], "media_kind": "movie" }
+                },
+                "name": "Local files"
+            }))
+            .await
+            .json();
+        assert!(created.trickplay);
+        assert!(
+            created
+                .trickplay_service_filter
+                .is_empty()
+        );
+        let rules = ctx
+            .0
+            .sessions
+            .trickplay
+            .addon_rules();
+        let rule = rules
+            .get(&created.id)
+            .expect("the snapshot has the new addon");
+        assert!(rule.trickplay);
+        assert!(
+            rule.service_filter
+                .is_empty()
+        );
+
+        let updated: AddonDto = server
+            .post(&format!("/addons/{}", created.id))
+            .add_header(h.clone(), v.clone())
+            .json(&json!({
+                "trickplay": false,
+                "trickplayServiceFilter": ["realdebrid", "torbox"]
+            }))
+            .await
+            .json();
+        let filter = vec!["realdebrid".to_string(), "torbox".to_string()];
+        assert!(!updated.trickplay);
+        assert_eq!(updated.trickplay_service_filter, filter);
+        // Fields the update did not name stay as they were.
+        assert_eq!(updated.name, "Local files");
+        assert_eq!(updated.resources, created.resources);
+        assert!(!updated.http_redirect_stream);
+        assert!(
+            updated
+                .service_filter
+                .is_empty()
+        );
+        let rules = ctx
+            .0
+            .sessions
+            .trickplay
+            .addon_rules();
+        let rule = rules
+            .get(&created.id)
+            .expect("the snapshot still has the addon");
+        assert!(!rule.trickplay);
+        assert_eq!(rule.service_filter, filter);
+
+        // An update that names neither leaves both.
+        let renamed: AddonDto = server
+            .post(&format!("/addons/{}", created.id))
+            .add_header(h.clone(), v.clone())
+            .json(&json!({ "name": "Local films" }))
+            .await
+            .json();
+        assert_eq!(renamed.name, "Local films");
+        assert!(!renamed.trickplay);
+        assert_eq!(renamed.trickplay_service_filter, filter);
+
+        let del_resp = server
+            .delete(&format!("/addons/{}", created.id))
+            .add_header(h, v)
+            .await;
+        del_resp.assert_status(http::StatusCode::NO_CONTENT);
+        assert!(
+            ctx.0
+                .sessions
+                .trickplay
+                .addon_rules()
+                .get(&created.id)
+                .is_none(),
+            "the snapshot dropped the deleted addon"
+        );
+    }
+
+    #[tokio::test]
     async fn create_addon_rejects_unknown_kind() {
         let (server, _ctx, token) = authenticated_server().await;
         let (h, v) = auth(&token);
@@ -1116,6 +1230,8 @@ mod test {
             subtitle_extraction: false,
             probe_on_scan: false,
             service_filter: vec![],
+            trickplay: true,
+            trickplay_service_filter: vec![],
         };
         addon
             .insert(
@@ -1189,6 +1305,8 @@ mod test {
             subtitle_extraction: false,
             probe_on_scan: false,
             service_filter: vec![],
+            trickplay: true,
+            trickplay_service_filter: vec![],
         };
         addon
             .insert(
