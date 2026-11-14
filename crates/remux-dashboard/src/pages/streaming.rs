@@ -21,6 +21,8 @@ struct StreamingSettingsState {
     p2p_enabled: Signal<bool>,
     p2p_upload_speed: Signal<i64>,
     p2p_download_speed: Signal<i64>,
+    trickplay_enabled: Signal<bool>,
+    trickplay_cache_mb: Signal<i64>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -40,6 +42,8 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
         p2p_enabled: use_signal(|| true),
         p2p_upload_speed: use_signal(|| 0),
         p2p_download_speed: use_signal(|| 0),
+        trickplay_enabled: use_signal(|| false),
+        trickplay_cache_mb: use_signal(|| 1024),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -112,6 +116,18 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                                 .unwrap_or(0),
                         );
                     load_state
+                        .trickplay_enabled
+                        .set(
+                            cfg.trickplay_while_streaming
+                                .unwrap_or(false),
+                        );
+                    load_state
+                        .trickplay_cache_mb
+                        .set(
+                            cfg.trickplay_cache_size_mb
+                                .unwrap_or(1024),
+                        );
+                    load_state
                         .config
                         .set(Some(cfg));
                 }
@@ -180,6 +196,16 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                     .p2p_download_speed
                     .peek(),
             ),
+            trickplay_while_streaming: Some(
+                *state
+                    .trickplay_enabled
+                    .peek(),
+            ),
+            trickplay_cache_size_mb: Some(
+                *state
+                    .trickplay_cache_mb
+                    .peek(),
+            ),
             ..config
         };
         state
@@ -227,6 +253,7 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                 StreamingSortPanel {}
                 StreamingProbePanel {}
                 StreamingP2pPanel {}
+                StreamingTrickplayPanel {}
 
                 if let Some(error) = state.error.read().as_ref() {
                     ErrorAlert { message: error.clone() }
@@ -427,6 +454,59 @@ fn StreamingP2pPanel() -> Element {
                             },
                         }
                         p { class: "field-hint", "0 = unlimited." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn StreamingTrickplayPanel() -> Element {
+    let mut state = use_context::<StreamingSettingsState>();
+    rsx! {
+        Card { title: "Trick play while streaming",
+            div { style: "display:flex;flex-direction:column;gap:14px",
+                ToggleRow {
+                    label: "Make seek previews while streaming",
+                    description: "Off by default. Shows the small pictures that Jellyfin apps which support trick play display while you skip through a film or episode. Remux has no local copy to prepare them from in advance, so it makes them in the background while someone is watching, by reading the whole file from its source a second time.",
+                    checked: *state.trickplay_enabled.read(),
+                    disabled: *state.saving.read(),
+                    on_change: move |value| {
+                        state.trickplay_enabled.set(value);
+                        state.saved.set(false);
+                    }
+                }
+                div { style: "border-left:3px solid var(--warning);padding-left:10px",
+                    p { class: "field-label", "Before you turn this on:" }
+                    ol { class: "field-hint", style: "margin:0;padding-left:18px",
+                        li { "Each play can read the whole file a second time from its source, even if only a few minutes are watched. A file whose pictures did not finish is read again from the start the next time it is played. This counts against debrid fair-use limits, usenet quotas and metered connections." }
+                        li { "Each play opens a second connection to the source and reads as fast as the source allows. A source that allows one connection at a time may refuse it or interrupt the video being watched. You can turn previews off for one addon, or limit them to some services, where you edit that addon." }
+                        li { "It uses processor time (about one CPU core while pictures are being made, at low priority) and disk space (about 9 MB for a two-hour film, up to the limit below)." }
+                        li { "Pictures arrive gradually, starting from the beginning of the file, usually several times faster than playing speed. Early in a long or 4K film, skipping far ahead shows no picture yet. Playing the same file again shows them all at once." }
+                        li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source, or a failed attempt) the box is empty or grey, and some apps may show an older picture." }
+                        li { "One video is processed at a time. Other plays wait their turn and may end before their pictures are made." }
+                        li { "Not made for Live TV, IPTV, torrents, sources set to bypass the Remux proxy, videos shorter than 5 minutes or longer than 4 hours. IPTV reached through another addon is not detected: limit that addon's previews to its other services where you edit it." }
+                    }
+                }
+                if *state.trickplay_enabled.read() {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "trickplay-cache", "Disk space for pictures (MB)" }
+                        input {
+                            id: "trickplay-cache",
+                            r#type: "number",
+                            class: "field-input",
+                            min: "100",
+                            value: "{state.trickplay_cache_mb}",
+                            disabled: *state.saving.read(),
+                            oninput: move |event| {
+                                if let Ok(value) = event.value().parse::<i64>() {
+                                    state.trickplay_cache_mb.set(value);
+                                    state.saved.set(false);
+                                }
+                            },
+                        }
+                        p { class: "field-hint", "When full, the pictures used longest ago are deleted first. Pictures not shown for 30 days are deleted anyway. Remux also stops making pictures when less than 2 GB of disk is free. Turning this off stops new pictures; the ones already made are deleted the next time Remux starts." }
                     }
                 }
             }

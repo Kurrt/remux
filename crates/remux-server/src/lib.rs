@@ -49,6 +49,7 @@ mod subtitle_selection;
 pub mod tasks;
 pub mod tools;
 mod torrent;
+pub mod trickplay;
 mod web_client;
 mod web_patches;
 mod web_transform;
@@ -365,6 +366,9 @@ pub async fn init_app(
             ctx.clone(),
         ));
 
+    // Which addons' streams may advertise trick play pictures.
+    trickplay::refresh_addon_rules(&ctx).await;
+
     // Sync intro items at startup (best-effort; errors are logged not fatal).
     if let Err(e) = intro::sync_intros(&ctx).await {
         warn!(err = ?e, "intro sync failed at startup");
@@ -378,6 +382,21 @@ pub async fn init_app(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60 * 15),
         );
+
+    // Trick play pictures past their age or the disk cap, or all of them when
+    // the switch is off. No pass runs yet. Test servers skip it: their data
+    // directory may be a real one.
+    if !ctx
+        .config
+        .disable_startup_tasks
+    {
+        tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                trickplay::prune_at_startup(&ctx).await;
+            }
+        });
+    }
 
     db::StreamGroup::migrate_from_settings(&conn).await;
 

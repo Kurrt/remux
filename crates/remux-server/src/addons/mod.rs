@@ -4685,6 +4685,8 @@ mod tests {
                 subtitle_extraction: false,
                 probe_on_scan: false,
                 service_filter: vec![],
+                trickplay: true,
+                trickplay_service_filter: vec![],
             },
             caps: AddonCapabilities {
                 tree: Some(std::sync::Arc::new(SpyTree { called })),
@@ -4814,6 +4816,8 @@ mod tests {
                 subtitle_extraction: false,
                 probe_on_scan: false,
                 service_filter: vec![],
+                trickplay: true,
+                trickplay_service_filter: vec![],
             },
             caps: AddonCapabilities {
                 subtitle: Some(std::sync::Arc::new(CountingSubtitleAddon {
@@ -4883,6 +4887,8 @@ mod tests {
                 subtitle_extraction: false,
                 probe_on_scan: false,
                 service_filter: vec![],
+                trickplay: true,
+                trickplay_service_filter: vec![],
             },
             caps: AddonCapabilities {
                 manifest_unreachable: true,

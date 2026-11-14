@@ -413,6 +413,14 @@ pub struct AddonDto {
     pub probe_on_scan: bool,
     #[serde(default)]
     pub service_filter: Vec<String>,
+    /// Make seek previews for this addon's streams while the server-wide
+    /// switch is on.
+    #[serde(default = "default_true")]
+    pub trickplay: bool,
+    /// Service IDs or inner addon names to make seek previews for. Empty
+    /// means all.
+    #[serde(default)]
+    pub trickplay_service_filter: Vec<String>,
     pub description: Option<String>,
     /// The addon's manifest could not be fetched when it was loaded, so the
     /// supported resources/types shown are the static fallback.
@@ -454,6 +462,8 @@ pub struct UpdateAddonRequest {
     pub subtitle_extraction: Option<bool>,
     pub probe_on_scan: Option<bool>,
     pub service_filter: Option<Vec<String>>,
+    pub trickplay: Option<bool>,
+    pub trickplay_service_filter: Option<Vec<String>>,
 }
 
 /// One catalog exposed by an addon, merged with its current config state.
@@ -827,6 +837,14 @@ pub struct ServerConfiguration {
     /// language anyway). Default: 1.
     #[default(Some(1_i64))]
     pub max_external_subtitles_per_language: Option<i64>,
+    /// Make Jellyfin trick play pictures (seek previews) in the background while
+    /// a video plays, by reading the whole file from its source a second time.
+    /// Off by default: it can more than double what each play fetches.
+    #[default(Some(false))]
+    pub trickplay_while_streaming: Option<bool>,
+    /// Disk space for those pictures, in MB. Least recently used go first.
+    #[default(Some(1024_i64))]
+    pub trickplay_cache_size_mb: Option<i64>,
 }
 
 #[derive(
@@ -4713,7 +4731,21 @@ pub struct BaseItemDto {
     pub has_series_timer: Option<bool>,
     pub has_timer: Option<bool>,
     pub provider_ids: Option<ProviderIds>,
+    /// Jellyfin's trick play manifest: media source id, then width, then info.
+    pub trickplay: Option<HashMap<String, HashMap<String, TrickplayInfoDto>>>,
     pub remux: Option<RemuxInfo>,
+}
+
+/// One trick play resolution of one media source, as Jellyfin sends it.
+#[dto]
+pub struct TrickplayInfoDto {
+    pub width: i32,
+    pub height: i32,
+    pub tile_width: i32,
+    pub tile_height: i32,
+    pub thumbnail_count: i32,
+    pub interval: i32,
+    pub bandwidth: i32,
 }
 
 #[dto]

@@ -213,6 +213,41 @@ pub async fn report_playback_start(
                 .device
                 .id,
         );
+    // Trick play pictures, keyed by the play session id as stored: a client
+    // that sent none was given one by `start`.
+    if let Some(playback) = playback
+        .as_ref()
+        .filter(|p| p.item_id == data.item_id)
+        && crate::trickplay::enabled(
+            &db::Settings::get_config_or_default(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await,
+        )
+    {
+        crate::trickplay::start_for_play(
+            &state.ctx,
+            crate::trickplay::PlayStart {
+                play_session_id: playback
+                    .play_session_id
+                    .clone(),
+                item_id: data.item_id,
+                media_source_id: data
+                    .media_source_id
+                    .as_deref()
+                    .and_then(|sid| Uuid::parse_str(sid).ok()),
+                device_id: session
+                    .device
+                    .id
+                    .clone(),
+                user_id: session
+                    .user
+                    .id,
+            },
+        );
+    }
     state
         .ctx
         .signals

@@ -1,0 +1,2 @@
+ALTER TABLE addons ADD COLUMN trickplay BOOLEAN NOT NULL DEFAULT 1;
+ALTER TABLE addons ADD COLUMN trickplay_service_filter TEXT NOT NULL DEFAULT '[]';

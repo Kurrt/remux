@@ -409,6 +409,8 @@ pub async fn register_media_tracker(
         subtitle_extraction: false,
         probe_on_scan: false,
         service_filter: vec![],
+        trickplay: true,
+        trickplay_service_filter: vec![],
     };
     row.insert(&ctx.db)
         .await

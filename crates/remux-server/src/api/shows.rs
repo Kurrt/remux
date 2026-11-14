@@ -135,10 +135,33 @@ pub async fn shows_episodes(
             }
         }
     }
+    // Trick play only when asked for: it needs the configuration, read once.
+    let trickplay = q
+        .fields
+        .as_deref()
+        .is_some_and(|f| f.contains(&api::ItemFields::Trickplay))
+        && crate::trickplay::enabled(
+            &db::Settings::get_config_or_default(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await,
+        );
+    let trickplay_addons = if trickplay {
+        state
+            .ctx
+            .sessions
+            .trickplay
+            .addon_rules()
+    } else {
+        std::sync::Arc::default()
+    };
     let items = get_items(state, session.clone(), q.clone(), true)
         .await?
         .with_permissions()
         .with_client_patches()
+        .with_trickplay(trickplay, trickplay_addons)
         .build();
 
     Ok(Json(serde_json::json!({
