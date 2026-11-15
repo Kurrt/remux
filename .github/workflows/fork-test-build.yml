@@ -22,6 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set the version the server reports
+        # Release builds get their version from the release workflow; without it the server
+        # reports 0.0.0, which clients take for a very old server.
+        run: sed -i 's/^version = "0.0.0"/version = "0.41.0"/' crates/*/Cargo.toml
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,6 +58,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       - uses: actions/checkout@v4
+      - name: Set the version the server reports
+        # Release builds get their version from the release workflow; without it the server
+        # reports 0.0.0, which clients take for a very old server.
+        run: sed -i 's/^version = "0.0.0"/version = "0.41.0"/' crates/*/Cargo.toml
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
