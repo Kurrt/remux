@@ -845,6 +845,10 @@ pub struct ServerConfiguration {
     /// Disk space for those pictures, in MB. Least recently used go first.
     #[default(Some(1024_i64))]
     pub trickplay_cache_size_mb: Option<i64>,
+    /// Days those pictures are kept after they were last shown. 0 never deletes
+    /// them by age.
+    #[default(Some(30_i64))]
+    pub trickplay_keep_days: Option<i64>,
 }
 
 #[derive(

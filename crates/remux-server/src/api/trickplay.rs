@@ -64,7 +64,7 @@ pub(crate) struct SheetRequest<'a> {
     pub file: &'a str,
 }
 
-/// Resolves the stream from cheap state, then serves its sheet from `root`.
+/// Resolves the set from cheap state, then serves its sheet from `root`.
 pub(crate) async fn serve_sheet(
     ctx: &AppContext,
     root: &std::path::Path,
@@ -79,21 +79,27 @@ pub(crate) async fn serve_sheet(
     if !trickplay::enabled(&db::Settings::get_config_or_default(&ctx.db).await) {
         return not_found();
     }
-    let Some(stream_id) =
-        resolve_stream(ctx, req.user_id, req.device_id, req.id, req.media_source_id)
-            .await
+    let Some(set_id) =
+        resolve_set(ctx, req.user_id, req.device_id, req.id, req.media_source_id).await
     else {
         return not_found();
     };
     // Any sheet on disk is whole: each is renamed into place once written, and
-    // a pass that stops early deletes its last one.
-    let Ok(bytes) = tokio::fs::read(trickplay::sheet_path(root, stream_id, n)).await
+    // a pass that ends short by itself deletes the last one it wrote.
+    let Ok(bytes) = tokio::fs::read(trickplay::sheet_path(root, set_id, n)).await
     else {
         return not_found();
     };
+    if bytes.is_empty() {
+        return not_found();
+    }
+    let dir = trickplay::set_dir(root, set_id);
+    if gap_below(ctx, root, set_id, req.device_id, n).await {
+        return not_found();
+    }
     ctx.sessions
         .trickplay
-        .mark_used(stream_id, &trickplay::stream_dir(root, stream_id));
+        .mark_used(set_id, &dir);
     (
         StatusCode::OK,
         [
@@ -105,12 +111,46 @@ pub(crate) async fn serve_sheet(
         .into_response()
 }
 
-/// The stream whose pictures this device gets for `id`: the file its play
-/// registered, then the stream its PlaybackInfo picked. Never a stream lookup:
-/// that can refresh addon streams, players ask for a sheet on nearly every
-/// move of the seek bar, and it could pick another file than the one whose
-/// pictures exist.
-async fn resolve_stream(
+/// Whether sheet `n` must wait because a sheet below it is missing: an app
+/// that fetches every sheet when play starts and joins them in order would
+/// show every later picture in the wrong place for the whole play. Never for
+/// a finished set, nor once the asking device's own play of the set is past
+/// the start delay; apps that work out the sheet from the position then get
+/// every sheet that exists.
+async fn gap_below(
+    ctx: &AppContext,
+    root: &std::path::Path,
+    set_id: Uuid,
+    device_id: &str,
+    n: u32,
+) -> bool {
+    if n == 0 || trickplay::is_done(&trickplay::set_dir(root, set_id)) {
+        return false;
+    }
+    if ctx
+        .sessions
+        .trickplay
+        .open_for(set_id, device_id)
+    {
+        return false;
+    }
+    for below in 0..n {
+        let present = tokio::fs::metadata(trickplay::sheet_path(root, set_id, below))
+            .await
+            .is_ok_and(|m| m.len() > 0);
+        if !present {
+            return true;
+        }
+    }
+    false
+}
+
+/// The set whose pictures this device gets for `id`: the one its play
+/// registered, then the one of the stream its PlaybackInfo picked. Never a
+/// stream lookup: that can refresh addon streams, players ask for a sheet on
+/// nearly every move of the seek bar, and it could pick another file than
+/// the one whose pictures exist.
+async fn resolve_set(
     ctx: &AppContext,
     user_id: Uuid,
     device_id: &str,
@@ -120,19 +160,20 @@ async fn resolve_stream(
     let passes = &ctx
         .sessions
         .trickplay;
-    if let Some(stream_id) = passes.selected_stream(id, device_id) {
-        return Some(stream_id);
+    if let Some(set_id) = passes.selected_set(id, device_id) {
+        return Some(set_id);
     }
     // A version held as the item id maps back to its owner, the key a play
     // registers under and PlaybackInfo saves its pick under.
     let (owner, source) =
         StreamService::version_target(ctx, Some(UserId(user_id)), id, media_source_id)
             .await;
-    passes
-        .selected_stream(owner, device_id)
-        .or_else(|| {
-            StreamService::selected_stream_id(ctx, Some(device_id), owner, source, None)
-        })
+    if let Some(set_id) = passes.selected_set(owner, device_id) {
+        return Some(set_id);
+    }
+    let stream_id =
+        StreamService::selected_stream_id(ctx, Some(device_id), owner, source, None)?;
+    Some(trickplay::set_for_stream(ctx, stream_id).await)
 }
 
 fn not_found() -> Response {
@@ -218,23 +259,105 @@ mod tests {
         film
     }
 
-    /// Records that the test device's play of `item_id` reads `stream_id`, as
-    /// a play-start report does once its file is resolved.
-    fn record_selection(ctx: &AppContext, item_id: Uuid, stream_id: Uuid) {
+    /// Records that the test device's play of `item_id` reads `set_id`, as a
+    /// play-start report does once its file is resolved.
+    fn record_selection(ctx: &AppContext, item_id: Uuid, set_id: Uuid) {
         let passes = &ctx
             .sessions
             .trickplay;
         passes.register("invented-play", item_id, "test-device");
-        assert!(passes.attach("invented-play", stream_id));
+        assert!(passes.attach("invented-play", set_id));
     }
 
-    fn write_sheet(ctx: &AppContext, stream_id: Uuid, n: u32) {
+    fn write_sheet(ctx: &AppContext, set_id: Uuid, n: u32) {
+        write_sheet_bytes(ctx, set_id, n, b"jpeg");
+    }
+
+    fn write_sheet_bytes(ctx: &AppContext, set_id: Uuid, n: u32, bytes: &[u8]) {
         let root = trickplay::root_dir(
             &ctx.config
                 .data_dir,
         );
-        std::fs::create_dir_all(trickplay::stream_dir(&root, stream_id)).unwrap();
-        std::fs::write(trickplay::sheet_path(&root, stream_id, n), b"jpeg").unwrap();
+        std::fs::create_dir_all(trickplay::set_dir(&root, set_id)).unwrap();
+        std::fs::write(trickplay::sheet_path(&root, set_id, n), bytes).unwrap();
+    }
+
+    /// A stored version of `film` measured by ffprobe at `secs` seconds.
+    async fn version(
+        ctx: &AppContext,
+        film: &db::Media,
+        idx: i64,
+        secs: f64,
+    ) -> db::Media {
+        let name = format!("Lantern.Keeper.Version{idx}.mkv");
+        let mut stream = db::Media {
+            title: name.clone(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(film.id),
+            idx: Some(idx),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    name.clone()
+                        .into(),
+                ),
+                filename: Some(name),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                run_time_ticks: Some((secs * 10_000_000.0).round() as i64),
+                remux: Some(api::MediaSourceRemuxInfo {
+                    provider_info: None,
+                    source: Some(api::ProbeOrigin::Ffprobe),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        stream
+    }
+
+    /// Saves `stream` as the version PlaybackInfo picked for `film` on
+    /// `device_id`.
+    fn pick(ctx: &AppContext, device_id: &str, film: &db::Media, stream: &db::Media) {
+        crate::services::StreamService::save_device_selection(
+            ctx, device_id, film.id, film.id, stream.id,
+        );
+    }
+
+    /// Asks for sheet `file` of `film` as `device_id`, with no MediaSourceId.
+    async fn ask(
+        ctx: &AppContext,
+        device_id: &str,
+        film: &db::Media,
+        file: &str,
+    ) -> (http::StatusCode, Vec<u8>) {
+        let root = trickplay::root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        let response = super::serve_sheet(
+            ctx,
+            &root,
+            super::SheetRequest {
+                user_id: Uuid::new_v4(),
+                device_id,
+                id: film.id,
+                media_source_id: None,
+                width: trickplay::WIDTH,
+                file,
+            },
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
     }
 
     #[tokio::test]
@@ -368,5 +491,119 @@ mod tests {
         assert_eq!(own.status(), http::StatusCode::OK);
         let other = super::serve_sheet(ctx, &root, request("other-device")).await;
         assert_eq!(other.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn versions_of_one_count_share_a_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, guard, _token) = server_in(dir.path()).await;
+        let ctx = &guard.0;
+        set_switch(ctx, true).await;
+        let film = invented_film(ctx).await;
+        let a = version(ctx, &film, 0, 9_391.756).await;
+        let b = version(ctx, &film, 1, 9_391.776).await;
+        let c = version(ctx, &film, 2, 7_800.0).await;
+        assert_eq!(trickplay::set_id(&a), trickplay::set_id(&b));
+        assert_ne!(trickplay::set_id(&a), trickplay::set_id(&c));
+        write_sheet_bytes(ctx, trickplay::set_id(&a), 0, b"from version a");
+
+        // A play of version B is served the pictures version A made.
+        pick(ctx, "test-device", &film, &b);
+        assert_eq!(
+            ask(ctx, "test-device", &film, "0.jpg").await,
+            (http::StatusCode::OK, b"from version a".to_vec())
+        );
+        // Version C has another length: nothing of A's set.
+        pick(ctx, "test-device", &film, &c);
+        let (status, _) = ask(ctx, "test-device", &film, "0.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_plays_set_is_not_served_to_the_next_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, guard, _token) = server_in(dir.path()).await;
+        let ctx = &guard.0;
+        set_switch(ctx, true).await;
+        let film = invented_film(ctx).await;
+        let long = version(ctx, &film, 0, 9_391.756).await;
+        let short = version(ctx, &film, 1, 7_800.0).await;
+        write_sheet_bytes(ctx, trickplay::set_id(&long), 0, b"long cut");
+        write_sheet_bytes(ctx, trickplay::set_id(&short), 0, b"short cut");
+
+        record_selection(ctx, film.id, trickplay::set_id(&long));
+        pick(ctx, "test-device", &film, &short);
+        assert_eq!(
+            ask(ctx, "test-device", &film, "0.jpg").await,
+            (http::StatusCode::OK, b"long cut".to_vec())
+        );
+        // The long play stops; PlaybackInfo has picked the short version and
+        // no start report has come yet: the short cut's own set, at once.
+        ctx.sessions
+            .trickplay
+            .release("invented-play");
+        assert_eq!(
+            ask(ctx, "test-device", &film, "0.jpg").await,
+            (http::StatusCode::OK, b"short cut".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gap_hides_later_sheets_until_the_devices_play_is_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, guard, _token) = server_in(dir.path()).await;
+        let ctx = &guard.0;
+        set_switch(ctx, true).await;
+        let film = invented_film(ctx).await;
+        let gapped = version(ctx, &film, 0, 9_391.756).await;
+        let gapped_set = trickplay::set_id(&gapped);
+        write_sheet(ctx, gapped_set, 3);
+        write_sheet(ctx, gapped_set, 4);
+
+        // A device with no play, whose PlaybackInfo picked this version.
+        pick(ctx, "other-device", &film, &gapped);
+        let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        // The test device's own play, younger than the start delay.
+        record_selection(ctx, film.id, gapped_set);
+        let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        // Once its play is past the start delay, that device gets what
+        // exists, with no pass queued; the other device still does not.
+        ctx.sessions
+            .trickplay
+            .backdate("invented-play", trickplay::START_DELAY);
+        let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::OK);
+        let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        // An empty sheet is never served.
+        write_sheet_bytes(ctx, gapped_set, 5, b"");
+        let (status, _) = ask(ctx, "test-device", &film, "5.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        // A finished set is served whole, gap or not.
+        let root = trickplay::root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        std::fs::write(trickplay::set_dir(&root, gapped_set).join("done"), b"")
+            .unwrap();
+        let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::OK);
+
+        // A set with no gap answers every sheet to anyone.
+        let whole = version(ctx, &film, 1, 7_800.0).await;
+        for n in 0..3 {
+            write_sheet(ctx, trickplay::set_id(&whole), n);
+        }
+        pick(ctx, "other-device", &film, &whole);
+        for file in ["0.jpg", "1.jpg", "2.jpg"] {
+            let (status, _) = ask(ctx, "other-device", &film, file).await;
+            assert_eq!(status, http::StatusCode::OK, "{file}");
+        }
     }
 }
