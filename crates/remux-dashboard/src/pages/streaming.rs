@@ -23,6 +23,7 @@ struct StreamingSettingsState {
     p2p_download_speed: Signal<i64>,
     trickplay_enabled: Signal<bool>,
     trickplay_cache_mb: Signal<i64>,
+    trickplay_keep_days: Signal<i64>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -44,6 +45,7 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
         p2p_download_speed: use_signal(|| 0),
         trickplay_enabled: use_signal(|| false),
         trickplay_cache_mb: use_signal(|| 1024),
+        trickplay_keep_days: use_signal(|| 30),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -128,6 +130,12 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                                 .unwrap_or(1024),
                         );
                     load_state
+                        .trickplay_keep_days
+                        .set(
+                            cfg.trickplay_keep_days
+                                .unwrap_or(30),
+                        );
+                    load_state
                         .config
                         .set(Some(cfg));
                 }
@@ -204,6 +212,11 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
             trickplay_cache_size_mb: Some(
                 *state
                     .trickplay_cache_mb
+                    .peek(),
+            ),
+            trickplay_keep_days: Some(
+                *state
+                    .trickplay_keep_days
                     .peek(),
             ),
             ..config
@@ -480,12 +493,12 @@ fn StreamingTrickplayPanel() -> Element {
                 div { style: "border-left:3px solid var(--warning);padding-left:10px",
                     p { class: "field-label", "Before you turn this on:" }
                     ol { class: "field-hint", style: "margin:0;padding-left:18px",
-                        li { "Each play can read the whole file a second time from its source, even if only a few minutes are watched. A file whose pictures did not finish is read again from the start the next time it is played. This counts against debrid fair-use limits, usenet quotas and metered connections." }
+                        li { "The first play of a film or episode can read the whole file a second time from its source, even if only a few minutes are watched. Reading stops a minute after an app reports that play has stopped, and within about five minutes when an app goes silent without reporting it. Pictures that did not finish are started again from the beginning the next time it is played. This counts against debrid fair-use limits, usenet quotas and metered connections." }
                         li { "Each play opens a second connection to the source and reads as fast as the source allows. A source that allows one connection at a time may refuse it or interrupt the video being watched. You can turn previews off for one addon, or limit them to some services, where you edit that addon." }
                         li { "It uses processor time (about one CPU core while pictures are being made, at low priority) and disk space (about 9 MB for a two-hour film, up to the limit below)." }
-                        li { "Pictures arrive gradually, starting from the beginning of the file, usually several times faster than playing speed. Early in a long or 4K film, skipping far ahead shows no picture yet. Playing the same file again shows them all at once." }
+                        li { "Pictures arrive gradually, starting from the beginning of the file, usually several times faster than playing speed. Early in a long or 4K film, skipping far ahead shows no picture yet. Once made, they show at once on every later play, in any version whose length gives the same number of pictures (lengths that round up to the same 10 seconds). A version of another length (an extended cut, a sped-up copy, a file holding two episodes) gets its own pictures. Two different cuts of the same length share pictures, so a preview can show the other cut." }
                         li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source, or a failed attempt) the box is empty or grey, and some apps may show an older picture." }
-                        li { "One video is processed at a time. Other plays wait their turn and may end before their pictures are made." }
+                        li { "One video is processed at a time. Other plays wait their turn and may end before their pictures are made. A video whose apps have all been silent for a minute gives way to one that is waiting, and carries on when its app reports again." }
                         li { "Not made for Live TV, IPTV, torrents, sources set to bypass the Remux proxy, videos shorter than 5 minutes or longer than 4 hours. IPTV reached through another addon is not detected: limit that addon's previews to its other services where you edit it." }
                     }
                 }
@@ -506,7 +519,26 @@ fn StreamingTrickplayPanel() -> Element {
                                 }
                             },
                         }
-                        p { class: "field-hint", "When full, the pictures used longest ago are deleted first. Pictures not shown for 30 days are deleted anyway. Remux also stops making pictures when less than 2 GB of disk is free. Turning this off stops new pictures; the ones already made are deleted the next time Remux starts." }
+                        p { class: "field-hint", "When full, the pictures shown longest ago are deleted first. Remux also stops making pictures when less than 2 GB of disk is free. Turning this off stops new pictures; the ones already made are deleted the next time Remux starts." }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", r#for: "trickplay-keep", "Keep pictures for (days)" }
+                        input {
+                            id: "trickplay-keep",
+                            r#type: "number",
+                            class: "field-input",
+                            min: "0",
+                            max: "3650",
+                            value: "{state.trickplay_keep_days}",
+                            disabled: *state.saving.read(),
+                            oninput: move |event| {
+                                if let Ok(value) = event.value().parse::<i64>() {
+                                    state.trickplay_keep_days.set(value);
+                                    state.saved.set(false);
+                                }
+                            },
+                        }
+                        p { class: "field-hint", "Pictures not shown for this many days are deleted. 0 never deletes them by age: they then go only when the disk space above is full." }
                     }
                 }
             }
