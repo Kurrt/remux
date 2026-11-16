@@ -6,9 +6,11 @@
 //! stream proxy, decodes key frames only and writes one 320x180 picture every
 //! 10 seconds, 25 to a sheet, under `{data_dir}/trickplay/{set id}/{n}.jpg`.
 //!
-//! A pass starts at the sheet the viewer is on, reads to the end of the file,
-//! then comes back for every sheet still missing, and moves (a few times at
-//! most) when the viewer jumps to a part with no pictures yet. The set's
+//! A pass works in order from the lowest missing sheet, so a set never has a
+//! gap. With `TrickplayStartAtPosition` also on (see [`start_at_position`]),
+//! it starts at the sheet the viewer is on, reads to the end of the file, then
+//! comes back for every sheet still missing, and moves (a few times at most)
+//! when the viewer seeks to a part with no pictures yet. The set's
 //! folder is the only record: sheets on disk are kept and built on, and the
 //! set is `done` only once a run reached the end and no sheet is missing.
 //!
@@ -96,12 +98,13 @@ pub const QUIET_WAITING: Duration = Duration::from_secs(60);
 /// waiting. It carries on when one of them reports again.
 pub const QUIET_ALONE: Duration = Duration::from_secs(5 * 60);
 /// Days pictures are kept after they were last shown, unless set otherwise.
+/// The admin page quotes this value.
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// Longest keep time that can be set, in days.
 pub const MAX_KEEP_DAYS: i64 = 3_650;
-/// Shortest runtime that gets pictures.
+/// Shortest runtime that gets pictures. The admin page quotes this value.
 pub const MIN_RUNTIME_SECS: u64 = 300;
-/// Longest runtime that gets pictures.
+/// Longest runtime that gets pictures. The admin page quotes this value.
 pub const MAX_RUNTIME_SECS: u64 = 4 * 60 * 60;
 /// No pass starts, and a running one stops, below this much free disk.
 pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -118,21 +121,26 @@ pub const NO_JUMP_WAIT: Duration = Duration::from_secs(60 * 60);
 /// long as someone watches. One sheet covers 250 s of video, so this leaves
 /// room for a source read at little more than playing speed.
 pub const STALL_WAIT: Duration = Duration::from_secs(10 * 60);
-/// A pass follows the viewer to a part with no pictures at most this often.
+/// A pass follows the viewer to a part with no pictures at most this often,
+/// with [`start_at_position`] only. A choice; nothing was measured for it.
 pub const FOLLOW_EVERY: Duration = Duration::from_secs(30);
-/// A pass follows the viewer at most this many times.
+/// A pass follows the viewer at most this many times, with
+/// [`start_at_position`] only. A choice; nothing was measured for it. The
+/// admin page quotes this value.
 pub const MAX_FOLLOWS: u32 = 4;
 /// Directory under `data_dir` that holds every set of pictures.
 pub const ROOT_DIR: &str = "trickplay";
 /// Rough pictures made at most before the detailed ones.
+/// The admin page quotes this value.
 pub const ROUGH_PICTURES: usize = 17;
-/// The rough stage ends after this long.
+/// The rough stage ends after this long. The admin page quotes this value.
 pub const ROUGH_BUDGET: Duration = Duration::from_secs(45);
 /// One rough picture is given up after this long.
 pub const ROUGH_SEEK_WAIT: Duration = Duration::from_secs(10);
 /// The rough stage ends after this many failed pictures in a row.
 pub const ROUGH_MAX_FAILS: u32 = 3;
 /// Smallest file, in bytes, that gets a rough stage.
+/// The admin page quotes this value.
 pub const ROUGH_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Smallest picture count (60 minutes) that gets a rough stage when the
 /// file's size is not known.
@@ -154,9 +162,9 @@ const END_MARKER: &str = "end";
 /// crash tells the start-up prune to check the sheets.
 const BUSY_MARKER: &str = "busy";
 /// Runs one pass makes at most: two (from the viewer to the end, then the
-/// beginning), two for each move to the viewer (the run it starts, and one
-/// more for the stretch it splits), one after a run that found nothing and
-/// one after a run that could not jump.
+/// beginning), two for each move to the viewer with [`start_at_position`]
+/// (the run it starts, and one more for the stretch it splits), one after a
+/// run that found nothing and one after a run that could not jump.
 const MAX_RUNS: u32 = 2 * MAX_FOLLOWS + 4;
 /// The slowest read assumed when waiting for the first sheet of a run that
 /// starts part way: the wait covers one sheet's share of the file at this
@@ -166,7 +174,7 @@ const SEEK_READ_BYTES_PER_SEC: u64 = 5 * 1024 * 1024;
 const TMP_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// A served directory's use time is updated at most this often.
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
-/// Smallest disk allowance, in MB.
+/// Smallest disk allowance, in MB. The admin page quotes this value.
 const MIN_CACHE_MB: i64 = 100;
 /// How long `kill_all` waits for each pass before killing its process. The
 /// kill after it works on Linux and macOS only (see [`kill_pid`]).
@@ -232,6 +240,16 @@ pub fn other_version(cfg: &api::ServerConfiguration) -> bool {
     enabled(cfg)
         && cfg
             .trickplay_other_version
+            .unwrap_or(false)
+}
+
+/// Whether a pass starts at the position being watched and follows seeks:
+/// both switches on. Otherwise it works in order from the lowest missing
+/// sheet, so a set never has a gap.
+pub fn start_at_position(cfg: &api::ServerConfiguration) -> bool {
+    enabled(cfg)
+        && cfg
+            .trickplay_start_at_position
             .unwrap_or(false)
 }
 
@@ -1257,7 +1275,9 @@ struct Run {
 /// sheet when there is none, and covers the unbroken stretch of missing
 /// sheets from there, so nothing already on disk is read again; it reads on
 /// to the end when that stretch reaches the last expected sheet before any
-/// run has reached the end.
+/// run has reached the end. The viewer's sheet is 0 unless
+/// [`start_at_position`] is on, so a run then starts at the lowest missing
+/// sheet and a set never gets a gap.
 fn next_run(
     missing: &[u32],
     viewer: u32,
@@ -1628,7 +1648,8 @@ fn follows_to(
         && follows < limits.max_follows
 }
 
-/// Estimated disk use of a runtime's pictures (about 330 KB a sheet).
+/// Estimated disk use of a runtime's pictures (about 330 KB a sheet). The
+/// admin page quotes it for a two-hour movie (about 9 MB).
 fn estimate_bytes(runtime_s: u64) -> u64 {
     runtime_s * 330 * 1024 / 250
 }
@@ -2239,6 +2260,7 @@ async fn resolve_plan(
         estimate,
         played: info.clone(),
         rough,
+        from_position: start_at_position(&cfg),
         db: Some(
             ctx.db
                 .clone(),
@@ -2392,6 +2414,9 @@ pub(crate) struct PassPlan {
     pub played: StreamInfo,
     /// Make rough pictures first (see [`rough_first`]).
     pub rough: bool,
+    /// Start at the viewer's sheet and follow seeks (see
+    /// [`start_at_position`]).
+    pub from_position: bool,
     /// Where the settings are read again when the pass takes the slot, since
     /// a queued pass may wait long after its play started, and again while it
     /// runs, so a switch turned off stops it. `None` in most tests.
@@ -3404,29 +3429,6 @@ impl TrickplayPasses {
             .and_then(|pass| pass.pictures)
     }
 
-    /// Whether `device_id` has a play tied to `set_id` that is at least the
-    /// start delay old. Until then a set with a missing sheet is served only
-    /// below the gap, so an app that fetches every sheet when play starts and
-    /// strings them together in order (Findroid 1.2.0's `getTrickplay` loop)
-    /// gets a clean run from sheet 0.
-    pub fn open_for(&self, set_id: Uuid, device_id: &str) -> bool {
-        let delay = self
-            .inner
-            .limits
-            .start_delay;
-        self.lock()
-            .by_session
-            .values()
-            .any(|reg| {
-                reg.set_id == Some(set_id)
-                    && reg.device_id == device_id
-                    && reg
-                        .at
-                        .elapsed()
-                        >= delay
-            })
-    }
-
     /// Notes that a set was just shown, so the cap and the keep time delete
     /// it last. Updates the directory's time at most once a minute.
     pub fn mark_used(&self, set_id: Uuid, dir: &Path) {
@@ -3983,9 +3985,11 @@ impl TrickplayPasses {
             return SlotEnd::Skipped;
         }
         // Switched off, or its addon's previews turned off, while this pass
-        // waited: start nothing. The rough stage and another version follow
-        // their own switches as they are now, too, and the disk limits are
-        // the ones saved now, not those of when the play started.
+        // waited: start nothing. The rough stage, another version and the
+        // start position follow their own switches as they are now, too, and
+        // the disk limits are the ones saved now, not those of when the play
+        // started. A change to the start position while the pass reads
+        // counts from its next turn.
         let cfg = match &plan.db {
             Some(pool) => Some(db::Settings::get_config_or_default(pool).await),
             None => None,
@@ -3993,17 +3997,19 @@ impl TrickplayPasses {
         if let Some(end) = self.refusal(plan, cfg.as_ref()) {
             return end;
         }
-        let (rough, cap, keep) = match &cfg {
+        let (rough, from_position, cap, keep) = match &cfg {
             Some(cfg) => (
                 plan.rough && rough_first(cfg),
+                start_at_position(cfg),
                 cap_bytes(cfg).saturating_sub(plan.estimate),
                 keep_for(cfg),
             ),
             // No settings (tests): nothing is pruned by size or age.
-            None => (plan.rough, u64::MAX, None),
+            None => (plan.rough, plan.from_position, u64::MAX, None),
         };
         let plan = &PassPlan {
             rough,
+            from_position,
             ..plan.clone()
         };
         let mut active: HashSet<Uuid> = self
@@ -4274,7 +4280,8 @@ impl TrickplayPasses {
     }
 
     /// The runs of one pass (see [`next_run`]), the first at the sheet the
-    /// viewer is on, until nothing is missing, a run fails, the pass is
+    /// viewer is on with [`start_at_position`], else at the lowest missing
+    /// sheet, until nothing is missing, a run fails, the pass is
     /// stopped or [`MAX_RUNS`] runs were made. The set is marked `done` once a
     /// run has reached the end of the file and no sheet is missing, so never
     /// before its beginning is made. `dir` follows the set if the key check
@@ -4293,9 +4300,12 @@ impl TrickplayPasses {
         W: Fn(&str, Uuid) -> Option<Watched>,
     {
         let expected = expected_sheets(plan.pictures);
-        let mut viewer = self
-            .quiet(plan.set_id, watch)
-            .map_or(0, |heard| sheet_at(heard.position_s, expected));
+        let mut viewer = if plan.from_position {
+            self.quiet(plan.set_id, watch)
+                .map_or(0, |heard| sheet_at(heard.position_s, expected))
+        } else {
+            0
+        };
         let mut follows = 0;
         let mut nothing = 0;
         // The sheets another version made in this slot. They are on trial: a
@@ -4468,9 +4478,9 @@ impl TrickplayPasses {
     /// One run of a pass. Every `watch_check` it asks whether the stream may
     /// still be read (see [`Self::refusal`]), then whether it has made no new
     /// sheet for [`STALL_WAIT`] (a stalled source), then whether to give way (see
-    /// [`Self::gives_way`]), then whether to follow the viewer to a part with
-    /// no pictures (see [`follows_to`]); any of them stops the run, which then
-    /// ends as cancelled.
+    /// [`Self::gives_way`]), then, with [`start_at_position`] only, whether to
+    /// follow the viewer to a part with no pictures (see [`follows_to`]); any
+    /// of them stops the run, which then ends as cancelled.
     #[allow(clippy::too_many_arguments)]
     async fn one_run<R, W>(
         &self,
@@ -4559,6 +4569,9 @@ impl TrickplayPasses {
                             "trick play pass giving way: nobody has watched it lately"
                         );
                         Some(Stopped::StoodDown)
+                    } else if !plan.from_position {
+                        // In order from the start: seeks are not followed.
+                        None
                     } else {
                         // Only a viewer heard from lately is followed.
                         self.quiet(plan.set_id, watch)
@@ -4907,18 +4920,6 @@ impl TrickplayPasses {
             .get(&set_id)
             .is_some_and(|p| p.waiting)
     }
-
-    /// Makes a registered play look `by` older, as if it had started then.
-    pub(crate) fn backdate(&self, play_session_id: &str, by: Duration) {
-        if let Some(reg) = self
-            .lock()
-            .by_session
-            .get_mut(play_session_id)
-            && let Some(at) = Instant::now().checked_sub(by)
-        {
-            reg.at = at;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4967,6 +4968,9 @@ mod tests {
             estimate: 0,
             played: StreamInfo::default(),
             rough: false,
+            // Today's tests start at the viewer; the tests of the default
+            // set it off.
+            from_position: true,
             db: None,
             others: Vec::new(),
             other_version: None,
@@ -5615,12 +5619,29 @@ mod tests {
             "read only while the main switch is on"
         );
         assert!(other_version(&other(true, true)));
+        assert_eq!(cfg.trickplay_start_at_position, Some(false));
+        assert!(!start_at_position(&cfg));
+        let start = |main: bool, on: bool| api::ServerConfiguration {
+            trickplay_while_streaming: Some(main),
+            trickplay_start_at_position: Some(on),
+            ..Default::default()
+        };
+        assert!(!start_at_position(&start(true, false)));
+        assert!(
+            !start_at_position(&start(false, true)),
+            "read only while the main switch is on"
+        );
+        assert!(start_at_position(&start(true, true)));
         let saved: api::ServerConfiguration = serde_json::from_value(
             serde_json::json!({ "TrickplayWhileStreaming": true }),
         )
         .unwrap();
         assert!(
             !other_version(&saved),
+            "a saved document without it reads as off"
+        );
+        assert!(
+            !start_at_position(&saved),
             "a saved document without it reads as off"
         );
         let small = api::ServerConfiguration {
@@ -7220,6 +7241,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_start_position_is_read_when_the_pass_takes_the_slot() {
+        let settings = |start: bool| api::ServerConfiguration {
+            trickplay_while_streaming: Some(true),
+            trickplay_cache_size_mb: Some(1024),
+            trickplay_start_at_position: Some(start),
+            ..Default::default()
+        };
+        for (planned, saved, starts) in
+            [(true, false, vec![0]), (false, true, vec![19, 0])]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            // The start position when the play starts.
+            let pool = settings_db(true, 1024).await;
+            db::Settings::set_config(&pool, &settings(planned))
+                .await
+                .unwrap();
+            let passes = TrickplayPasses::with_limits(fast());
+            let reports = Reports::default();
+            let runner = Arc::new(FakeRunner {
+                sheets: 38,
+                ..Default::default()
+            });
+            let held = passes
+                .inner
+                .slots
+                .acquire()
+                .await
+                .unwrap();
+            let set_id = Uuid::new_v4();
+            // 1 h 20 in: sheet 19 of 38.
+            reports.at("device-a", 80 * 60);
+            passes.register("play-a", Uuid::new_v4(), "device-a");
+            let begun = passes
+                .begin(
+                    "play-a",
+                    PassPlan {
+                        db: Some(pool.clone()),
+                        pictures: 940,
+                        from_position: planned,
+                        ..plan(tmp.path(), set_id)
+                    },
+                    runner.clone(),
+                    reports.watch(),
+                )
+                .await;
+            assert_eq!(begun, Begin::Queued);
+            // Saved after the play started, before its pass takes the slot.
+            db::Settings::set_config(&pool, &settings(saved))
+                .await
+                .unwrap();
+            drop(held);
+            until(|| !passes.is_queued(set_id)).await;
+            assert_eq!(runner.starts(), starts, "saved {saved}");
+            assert!(
+                set_dir(tmp.path(), set_id)
+                    .join(DONE_MARKER)
+                    .exists()
+            );
+        }
+    }
+
     #[test]
     fn the_start_up_prune_switched_off_deletes_only_its_own_folders() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8083,6 +8166,169 @@ mod tests {
         );
     }
 
+    /// A pass over a film of 940 pictures (sheets 0 to 37) with the start
+    /// position off.
+    fn in_order(root: &Path, set_id: Uuid) -> PassPlan {
+        PassPlan {
+            pictures: 940,
+            from_position: false,
+            ..plan(root, set_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn in_order_a_play_resumed_part_way_starts_at_the_beginning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let reports = Reports::default();
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            ..Default::default()
+        });
+        // 1 h 20 in, on a source that can seek: sheet 19 of 38.
+        reports.at("device-a", 80 * 60);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin(
+                "play-a",
+                in_order(tmp.path(), set_id),
+                runner.clone(),
+                reports.watch(),
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        until(|| !passes.is_queued(set_id)).await;
+        let dir = set_dir(tmp.path(), set_id);
+        assert_eq!(runner.starts(), vec![0], "one run, from the beginning");
+        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+        assert!(
+            dir.join(DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_order_an_unfinished_set_carries_on_at_its_first_missing_sheet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let reports = Reports::default();
+        let set_id = Uuid::new_v4();
+        let dir = set_dir(tmp.path(), set_id);
+        write_sheets(&dir, 0..5);
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            ..Default::default()
+        });
+        // The viewer far above them, at sheet 19.
+        reports.at("device-a", 80 * 60);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin(
+                "play-a",
+                in_order(tmp.path(), set_id),
+                runner.clone(),
+                reports.watch(),
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.starts(), vec![5], "not at the viewer's sheet");
+        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+        assert!(
+            dir.join(DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_order_a_gap_left_from_the_viewers_start_is_filled_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let reports = Reports::default();
+        let set_id = Uuid::new_v4();
+        // A pass that started at the viewer made sheets 19 to 37 and reached
+        // the end; the beginning is missing.
+        const ABOVE: &[u8] = &[0xFF, 0xD8, b'a', 0xFF, 0xD9];
+        let dir = set_dir(tmp.path(), set_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 19..38 {
+            std::fs::write(dir.join(format!("{n}.jpg")), ABOVE).unwrap();
+        }
+        std::fs::write(dir.join(END_MARKER), b"").unwrap();
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            ..Default::default()
+        });
+        reports.at("device-a", 100 * 60);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin(
+                "play-a",
+                in_order(tmp.path(), set_id),
+                runner.clone(),
+                reports.watch(),
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.starts(), vec![0]);
+        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+        for n in 19..38 {
+            assert_eq!(
+                std::fs::read(dir.join(format!("{n}.jpg"))).unwrap(),
+                ABOVE,
+                "the run stopped where the sheets on disk begin: {n}"
+            );
+        }
+        assert!(
+            dir.join(DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_order_a_seek_to_a_part_with_no_pictures_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let reports = Reports::default();
+        let set_id = Uuid::new_v4();
+        let dir = set_dir(tmp.path(), set_id);
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            pace: Duration::from_millis(15),
+            ..Default::default()
+        });
+        reports.at("device-a", 0);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin(
+                "play-a",
+                in_order(tmp.path(), set_id),
+                runner.clone(),
+                reports.watch(),
+            )
+            .await;
+        until(|| {
+            dir.join("1.jpg")
+                .exists()
+        })
+        .await;
+        // The viewer seeks to 1 h 20.
+        reports.at("device-a", 80 * 60);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.starts(), vec![0], "no run at the seek");
+        assert!(
+            !runner
+                .killed
+                .load(Ordering::SeqCst),
+            "the run was not stopped"
+        );
+        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+        assert!(
+            dir.join(DONE_MARKER)
+                .exists()
+        );
+    }
+
     #[tokio::test]
     async fn a_file_longer_than_its_count_moves_to_its_own_folder() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8446,33 +8692,6 @@ mod tests {
         assert_eq!(passes.selected_set(item_id, "device-a"), Some(short_set));
         passes.release("play-d");
         assert_eq!(passes.selected_set(item_id, "device-a"), None);
-    }
-
-    #[tokio::test]
-    async fn open_for_needs_the_devices_own_play_past_the_start_delay() {
-        let passes = TrickplayPasses::new();
-        let set_id = Uuid::new_v4();
-        assert!(!passes.open_for(set_id, "device-a"), "no play");
-        passes.register("play-a", Uuid::new_v4(), "device-a");
-        assert!(passes.attach("play-a", set_id));
-        assert!(
-            !passes.open_for(set_id, "device-a"),
-            "younger than the start delay"
-        );
-        passes.backdate("play-a", START_DELAY);
-        assert!(passes.open_for(set_id, "device-a"));
-        assert!(!passes.open_for(set_id, "device-b"), "another device");
-        assert!(!passes.open_for(Uuid::new_v4(), "device-a"), "another set");
-
-        // The same play session id reused for another item starts over.
-        passes.register("play-a", Uuid::new_v4(), "device-a");
-        assert!(!passes.open_for(set_id, "device-a"), "left the old set");
-        let other_set = Uuid::new_v4();
-        assert!(passes.attach("play-a", other_set));
-        assert!(
-            !passes.open_for(other_set, "device-a"),
-            "younger than the start delay again"
-        );
     }
 
     #[tokio::test]

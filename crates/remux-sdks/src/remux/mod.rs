@@ -837,30 +837,37 @@ pub struct ServerConfiguration {
     /// language anyway). Default: 1.
     #[default(Some(1_i64))]
     pub max_external_subtitles_per_language: Option<i64>,
-    /// Make Jellyfin trick play pictures (seek previews) in the background while
-    /// a video plays, by reading the whole file from its source a second time.
-    /// Off by default: it can more than double what each play fetches.
+    /// Make trick play pictures (seek previews) in the background while a
+    /// video plays, by reading the file from its source a second time.
+    /// Disabled by default: it can more than double what each play fetches.
     #[default(Some(false))]
     pub trickplay_while_streaming: Option<bool>,
-    /// Disk space for those pictures, in MB. Least recently used go first.
+    /// Disk space for seek previews, in MB. The ones shown longest ago are
+    /// deleted first. Default: 1024.
     #[default(Some(1024_i64))]
     pub trickplay_cache_size_mb: Option<i64>,
-    /// Days those pictures are kept after they were last shown. 0 never deletes
-    /// them by age.
+    /// Days seek previews are kept after they were last shown. 0 never
+    /// deletes them by age. Default: 30.
     #[default(Some(30_i64))]
     pub trickplay_keep_days: Option<i64>,
-    /// Before the detailed pictures, make a few spread across the whole file
-    /// and serve them as stand-ins, inside the "not ready" answer only, until
-    /// the detailed ones exist. Off by default; read only while
-    /// `trickplay_while_streaming` is on.
+    /// Before the detailed previews, make a few trick play pictures spread
+    /// across the whole file and serve them as stand-ins, inside the "not
+    /// ready" answer only, until the detailed ones exist. Disabled by default.
+    /// Read only while `trickplay_while_streaming` is on.
     #[default(Some(false))]
     pub trickplay_rough_first: Option<bool>,
-    /// When the version being played cannot be read for trick play pictures,
-    /// read another version of the same title in its place. Off by default:
-    /// it reads a file nobody chose. Read only while
+    /// When the version being played cannot be read for seek previews, read
+    /// another version of the same movie or episode in its place. Disabled by
+    /// default: it reads a file nobody chose. Read only while
     /// `trickplay_while_streaming` is on.
     #[default(Some(false))]
     pub trickplay_other_version: Option<bool>,
+    /// Start making trick play pictures at the position being watched and
+    /// follow seeks, instead of in order from the start of the file. Disabled
+    /// by default: until a file's pictures are finished there can be a gap
+    /// below the viewer. Read only while `trickplay_while_streaming` is on.
+    #[default(Some(false))]
+    pub trickplay_start_at_position: Option<bool>,
 }
 
 #[derive(

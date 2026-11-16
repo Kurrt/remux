@@ -129,9 +129,6 @@ pub(crate) async fn serve_sheet(
         }
         return not_ready();
     };
-    if gap_below(ctx, root, set_id, req.device_id, n).await {
-        return not_ready();
-    }
     ctx.sessions
         .trickplay
         .mark_used(set_id, &dir);
@@ -144,41 +141,6 @@ pub(crate) async fn serve_sheet(
         Body::from(bytes),
     )
         .into_response()
-}
-
-/// Whether sheet `n` must wait because a sheet below it is missing: an app
-/// that fetches every sheet when play starts and joins them in order
-/// (Findroid 1.2.0's `getTrickplay` loop) would show every later picture in
-/// the wrong place for the whole play. Never for a finished set, nor once the
-/// asking device's own play of the set is past the start delay; apps that
-/// work out the sheet from the position (the Jellyfin web, Android TV and
-/// Android clients) then get every sheet that exists.
-async fn gap_below(
-    ctx: &AppContext,
-    root: &std::path::Path,
-    set_id: Uuid,
-    device_id: &str,
-    n: u32,
-) -> bool {
-    if n == 0 || trickplay::is_done(&trickplay::set_dir(root, set_id)) {
-        return false;
-    }
-    if ctx
-        .sessions
-        .trickplay
-        .open_for(set_id, device_id)
-    {
-        return false;
-    }
-    for below in 0..n {
-        let present = tokio::fs::metadata(trickplay::sheet_path(root, set_id, below))
-            .await
-            .is_ok_and(|m| m.len() > 0);
-        if !present {
-            return true;
-        }
-    }
-    false
 }
 
 /// The set whose pictures this device gets for `id`: the one its play
@@ -232,11 +194,11 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
 }
 
-/// A sheet that is not made yet, or not served yet (see [`gap_below`]). 503
-/// and never kept, so an app asks again when the seek bar comes back to it;
-/// the Android TV (0.20.0) and Android (2.7.3) clients keep a 404 for good
-/// through Coil. No `Retry-After`: a `Retry-After: 0` makes OkHttp, which
-/// those clients fetch through, ask again at once.
+/// A sheet that is not made yet. 503 and never kept, so an app asks again
+/// when the seek bar comes back to it; the Android TV (0.20.0) and Android
+/// (2.7.3) clients keep a 404 for good through Coil. No `Retry-After`: a
+/// `Retry-After: 0` makes OkHttp, which those clients fetch through, ask
+/// again at once.
 fn not_ready() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -765,66 +727,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gap_hides_later_sheets_until_the_devices_play_is_older() {
+    async fn a_sheet_above_a_hole_is_served() {
         let dir = tempfile::tempdir().unwrap();
         let (_server, guard, _token) = server_in(dir.path()).await;
         let ctx = &guard.0;
         set_switch(ctx, true).await;
         let film = invented_film(ctx).await;
-        let gapped = version(ctx, &film, 0, 9_391.756).await;
-        let gapped_set = trickplay::set_id(&gapped);
-        write_sheet(ctx, gapped_set, 3);
-        write_sheet(ctx, gapped_set, 4);
+        let holed = version(ctx, &film, 0, 9_391.756).await;
+        let holed_set = trickplay::set_id(&holed);
+        write_sheet(ctx, holed_set, 3);
+        write_sheet(ctx, holed_set, 4);
 
-        // A device with no play, whose PlaybackInfo picked this version: not
-        // yet, which an app asks again for.
-        pick(ctx, "other-device", &film, &gapped);
-        let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
-
-        // The test device's own play, younger than the start delay.
-        record_selection(ctx, film.id, gapped_set);
-        let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
-
-        // Once its play is past the start delay, that device gets what
-        // exists, with no pass queued; the other device still does not.
-        ctx.sessions
-            .trickplay
-            .backdate("invented-play", trickplay::START_DELAY);
+        // The device with a play gets what exists at once, with sheets 0 to
+        // 2 missing and the set not finished.
+        record_selection(ctx, film.id, holed_set);
         let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
         assert_eq!(status, http::StatusCode::OK);
+        // So does a device with no play, whose PlaybackInfo picked this
+        // version.
+        pick(ctx, "other-device", &film, &holed);
         let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::OK);
+        // A sheet in the hole is not made yet.
+        let (status, _) = ask(ctx, "test-device", &film, "0.jpg").await;
         assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
         // An empty sheet is never served; it is made again.
-        write_sheet_bytes(ctx, gapped_set, 5, b"");
+        write_sheet_bytes(ctx, holed_set, 5, b"");
         let (status, _) = ask(ctx, "test-device", &film, "5.jpg").await;
         assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
-        // A finished set is served whole, gap or not, and a sheet missing
-        // from it is never made.
+        // A sheet missing from a finished set is never made.
         let root = trickplay::root_dir(
             &ctx.config
                 .data_dir,
         );
-        std::fs::write(trickplay::set_dir(&root, gapped_set).join("done"), b"")
-            .unwrap();
+        std::fs::write(trickplay::set_dir(&root, holed_set).join("done"), b"").unwrap();
         let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
         assert_eq!(status, http::StatusCode::OK);
         let (status, _) = ask(ctx, "other-device", &film, "1.jpg").await;
         assert_eq!(status, http::StatusCode::NOT_FOUND);
-
-        // A set with no gap answers every sheet to anyone.
-        let whole = version(ctx, &film, 1, 7_800.0).await;
-        for n in 0..3 {
-            write_sheet(ctx, trickplay::set_id(&whole), n);
-        }
-        pick(ctx, "other-device", &film, &whole);
-        for file in ["0.jpg", "1.jpg", "2.jpg"] {
-            let (status, _) = ask(ctx, "other-device", &film, file).await;
-            assert_eq!(status, http::StatusCode::OK, "{file}");
-        }
     }
 
     #[tokio::test]
@@ -907,15 +849,9 @@ mod tests {
         assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, ROUGH, "any device of the set gets the stand-in");
 
-        // The finished sheet: while the gap rule holds it back, an empty 503;
-        // then a 200 with the finished bytes, never the stand-in.
+        // The finished sheet: a 200 with the finished bytes at once, never
+        // the stand-in.
         write_sheet_bytes(ctx, set_id, 3, b"finished");
-        let (status, _, body) = ask_full(ctx, "test-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.is_empty(), "the gap answer carries no stand-in");
-        ctx.sessions
-            .trickplay
-            .backdate("invented-play", trickplay::START_DELAY);
         let (status, _, body) = ask_full(ctx, "test-device", &film, "3.jpg").await;
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(body, b"finished");
