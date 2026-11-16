@@ -660,25 +660,28 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                         span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to bypass Remux's proxy. Leave empty to apply to all." }
                                     }
                                 }
-                                // Seek previews: never made for the IPTV kind, so not offered there.
-                                if edit_resources.read().contains("stream") && !edit_kind.as_deref().is_some_and(|k| k.starts_with("iptv")) {
+                                // Seek previews: never made for the IPTV kind or for music, so not offered there.
+                                if edit_resources.read().contains("stream") && !edit_kind.as_deref().is_some_and(|k| k.starts_with("iptv")) && edit_form_values.read().get("media_kind").and_then(|v| v.as_str()) != Some("track") {
                                     div { class: "form-group",
                                         ToggleRow {
                                             label: "Make seek previews",
-                                            description: "Only has an effect while \"Make seek previews while streaming\" is on under Streaming settings. On by default. Turn it off for an addon whose sources limit connections: making previews opens a second connection to the source for each play. With \"Use another version when the one playing cannot be read\" on, its videos can still get previews made from another addon's version.",
+                                            description: "Make seek previews from this addon's streams while seek previews are turned on under Streaming, Seek Previews. Enabled by default.",
                                             checked: *edit_trickplay.read(),
                                             on_change: move |v| edit_trickplay.set(v),
                                         }
+                                        span { class: "field-hint", "Making previews opens a second connection to the source, so turn this off for sources that allow only one. Has no effect while \"Bypass Remux proxy\" is on." }
                                     }
-                                    div { class: "form-group",
-                                        label { class: "form-label", "Seek preview service filter" }
-                                        input {
-                                            class: "form-input",
-                                            placeholder: "real-debrid, alldebrid",
-                                            value: "{edit_trickplay_service_filter}",
-                                            oninput: move |e| edit_trickplay_service_filter.set(e.value()),
+                                    if *edit_trickplay.read() {
+                                        div { class: "form-group",
+                                            label { class: "form-label", "Seek preview service filter" }
+                                            input {
+                                                class: "form-input",
+                                                placeholder: "real-debrid, alldebrid",
+                                                value: "{edit_trickplay_service_filter}",
+                                                oninput: move |e| edit_trickplay_service_filter.set(e.value()),
+                                            }
+                                            span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to make seek previews for. Leave empty to apply to all. With a list, streams that name no service, such as IPTV VOD inside an addon that combines several sources, get none." }
                                         }
-                                        span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to make seek previews for. Leave empty to apply to all. With a list, streams that name no service, such as IPTV VOD inside an aggregating addon, get none." }
                                     }
                                 }
                                 if edit_kind.as_deref().is_some_and(|k| k.starts_with("opendal")) && edit_resources.read().contains("stream") {
