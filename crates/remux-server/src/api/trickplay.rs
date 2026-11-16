@@ -91,7 +91,9 @@ pub(crate) async fn serve_sheet(
         {
             Ok(found) => found,
             // No play and no PlaybackInfo pick for this device yet: a film or
-            // an episode may still get pictures, and an app keeps a 404.
+            // an episode may still get pictures, and the Android TV (0.20.0)
+            // and Android (2.7.3) clients keep a 404 through Coil and do not
+            // ask again.
             Err(owner) => {
                 return if can_have_pictures(ctx, owner).await {
                     not_ready()
@@ -145,11 +147,12 @@ pub(crate) async fn serve_sheet(
 }
 
 /// Whether sheet `n` must wait because a sheet below it is missing: an app
-/// that fetches every sheet when play starts and joins them in order would
-/// show every later picture in the wrong place for the whole play. Never for
-/// a finished set, nor once the asking device's own play of the set is past
-/// the start delay; apps that work out the sheet from the position then get
-/// every sheet that exists.
+/// that fetches every sheet when play starts and joins them in order
+/// (Findroid 1.2.0's `getTrickplay` loop) would show every later picture in
+/// the wrong place for the whole play. Never for a finished set, nor once the
+/// asking device's own play of the set is past the start delay; apps that
+/// work out the sheet from the position (the Jellyfin web, Android TV and
+/// Android clients) then get every sheet that exists.
 async fn gap_below(
     ctx: &AppContext,
     root: &std::path::Path,
@@ -215,22 +218,14 @@ async fn resolve_set(
 
 /// Whether `owner` is a stored item that may still get pictures: a film, an
 /// episode, or a stream or stream group not under a title or channel (see
-/// [`trickplay::manifest`] and [`trickplay::set_id`]). One row read by
-/// primary key.
+/// [`trickplay::kind_has_pictures`], [`trickplay::manifest`] and
+/// [`trickplay::set_id`]). One row read by primary key.
 async fn can_have_pictures(ctx: &AppContext, owner: Uuid) -> bool {
     db::Media::get_by_id(&ctx.db, &owner)
         .await
         .ok()
         .flatten()
-        .is_some_and(|item| {
-            matches!(
-                item.kind,
-                db::MediaKind::Movie
-                    | db::MediaKind::Episode
-                    | db::MediaKind::Stream
-                    | db::MediaKind::StreamGroup
-            ) && !item.is_live()
-        })
+        .is_some_and(|item| trickplay::kind_has_pictures(&item.kind) && !item.is_live())
 }
 
 fn not_found() -> Response {
@@ -239,8 +234,9 @@ fn not_found() -> Response {
 
 /// A sheet that is not made yet, or not served yet (see [`gap_below`]). 503
 /// and never kept, so an app asks again when the seek bar comes back to it;
-/// some apps keep a 404 for good. No `Retry-After`: when it is made is not
-/// known.
+/// the Android TV (0.20.0) and Android (2.7.3) clients keep a 404 for good
+/// through Coil. No `Retry-After`: a `Retry-After: 0` makes OkHttp, which
+/// those clients fetch through, ask again at once.
 fn not_ready() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -249,9 +245,11 @@ fn not_ready() -> Response {
         .into_response()
 }
 
-/// [`not_ready`], carrying the sheet's rough stand-in. Browser engines draw
-/// a picture that comes with an error status; apps that store pictures keep
-/// only a success, so they never keep this one.
+/// [`not_ready`], carrying the sheet's rough stand-in. The Jellyfin web
+/// client shows a sheet as a CSS background, and browser engines draw a
+/// picture that comes with an error status; the Android TV (0.20.0) and
+/// Android (2.7.3) clients store pictures through Coil, which keeps only a
+/// success, so they never keep this one.
 fn not_ready_with_rough(rough: Vec<u8>) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

@@ -359,6 +359,12 @@ pub async fn create_addon(
                 .db,
         )
         .await?;
+    // Before the reload, so a reload that fails leaves no stale rule.
+    state
+        .ctx
+        .sessions
+        .trickplay
+        .set_addon_rule(&addon);
     state
         .ctx
         .addons
@@ -545,6 +551,12 @@ pub async fn update_addon(
                 .db,
         )
         .await?;
+    // Before the reload, so a reload that fails leaves no stale rule.
+    state
+        .ctx
+        .sessions
+        .trickplay
+        .set_addon_rule(&addon);
     state
         .ctx
         .addons
@@ -610,6 +622,12 @@ pub async fn delete_addon(
         id,
     )
     .await?;
+    // Before the reload, so a reload that fails leaves no stale rule.
+    state
+        .ctx
+        .sessions
+        .trickplay
+        .drop_addon_rule(id);
     state
         .ctx
         .addons

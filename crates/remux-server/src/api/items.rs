@@ -119,7 +119,10 @@ fn trickplay_rows_ok(
 
 /// Jellyfin's `Trickplay` field. `rows_ok` (see [`trickplay_rows_ok`]) applies
 /// only when it lines up with the media sources; otherwise every source is
-/// judged by the item alone, as stub sources are.
+/// judged by the item alone, as stub sources are. A list asked for without
+/// `MediaSources` has one entry, under the item id, judged by the item alone:
+/// a list's rows come without their source rows, so the addon switches are
+/// not applied to it.
 fn trickplay_manifest(
     dto: &api::BaseItemDto,
     rows_ok: &[bool],
@@ -302,7 +305,14 @@ impl ItemsQueryResultBuilder {
                 };
                 if self.trickplay {
                     for dto in &mut dtos {
-                        dto.trickplay = Some(trickplay_manifest(dto, &[]));
+                        // A single item arrives with the field `item_for_user`
+                        // filled from its source rows and addon rules: kept.
+                        if dto
+                            .trickplay
+                            .is_none()
+                        {
+                            dto.trickplay = Some(trickplay_manifest(dto, &[]));
+                        }
                     }
                 }
                 dtos
@@ -9719,6 +9729,34 @@ mod tests {
             resp.json::<serde_json::Value>()
         }
 
+        // A list asked for one id is answered with the single item, whose
+        // entry the list builder must not fill again without the row checks.
+        async fn listed_trickplay(
+            server: &axum_test::TestServer,
+            auth: &str,
+            path: &str,
+        ) -> serde_json::Value {
+            let resp = server
+                .get(path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(auth).unwrap(),
+                )
+                .await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()["Items"][0]["Trickplay"].clone()
+        }
+        let user_id = get_user_id(&server, &auth).await;
+        let one = format!(
+            "ids={}&fields=Trickplay,MediaSources",
+            film.id
+                .simple()
+        );
+        let lists = [
+            format!("/items?{one}"),
+            format!("/users/{user_id}/items?{one}"),
+        ];
+
         let on = get_item(&server, &auth, film.id).await;
         assert!(
             !on["Trickplay"]
@@ -9727,6 +9765,14 @@ mod tests {
                 .is_empty(),
             "the addon's source is advertised while its switch is on: {on}"
         );
+        for path in &lists {
+            let on = listed_trickplay(&server, &auth, path).await;
+            assert!(
+                on.as_object()
+                    .is_some_and(|entries| !entries.is_empty()),
+                "{path}: the addon's source is advertised while its switch is on: {on}"
+            );
+        }
 
         server
             .post(&format!("/addons/{}", created.id))
@@ -9745,5 +9791,13 @@ mod tests {
                 .is_empty(),
             "no entry for the source of an addon switched off: {off}"
         );
+        for path in &lists {
+            let off = listed_trickplay(&server, &auth, path).await;
+            assert!(
+                off.as_object()
+                    .is_none_or(|entries| entries.is_empty()),
+                "{path}: no entry for the source of an addon switched off: {off}"
+            );
+        }
     }
 }

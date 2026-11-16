@@ -108,6 +108,16 @@ pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The shortest wait for the first sheet of a run that starts part way into
 /// the file. A source that gives none in time is read from its start.
 pub const SEEK_WAIT: Duration = Duration::from_secs(120);
+/// How long a source that gave no sheet in time after a seek (see
+/// [`SEEK_WAIT`]) is read from its start, and how long one that gave no
+/// rough picture in time at the end of the file gets no rough stage. One slow
+/// moment then does not mark it until the server restarts.
+pub const NO_JUMP_WAIT: Duration = Duration::from_secs(60 * 60);
+/// A run that makes no new sheet for this long has stalled: it is stopped
+/// and its stream counts as failed, so it does not hold the one slot for as
+/// long as someone watches. One sheet covers 250 s of video, so this leaves
+/// room for a source read at little more than playing speed.
+pub const STALL_WAIT: Duration = Duration::from_secs(10 * 60);
 /// A pass follows the viewer to a part with no pictures at most this often.
 pub const FOLLOW_EVERY: Duration = Duration::from_secs(30);
 /// A pass follows the viewer at most this many times.
@@ -158,8 +168,14 @@ const TMP_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// Smallest disk allowance, in MB.
 const MIN_CACHE_MB: i64 = 100;
-/// How long `kill_all` waits for each pass before killing its process.
+/// How long `kill_all` waits for each pass before killing its process. The
+/// kill after it works on Linux and macOS only (see [`kill_pid`]).
 const KILL_WAIT: Duration = Duration::from_secs(5);
+/// How much of ffmpeg's stderr a run keeps for its log, besides the lines
+/// that judge it (see [`StderrKept`]).
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+/// The longest stderr line kept; the rest of a longer one is left out.
+const STDERR_LINE_BYTES: usize = 1024;
 const TICKS_PER_SEC: i64 = 10_000_000;
 /// The rough stage composes its sheets again once this many rough pictures
 /// are on disk, and once more at its end if any were made since.
@@ -188,6 +204,11 @@ pub enum Ineligible {
     /// The addon's own switch is off, or its service list leaves the stream
     /// out.
     AddonExcluded,
+    /// The addon the stream names could not be read, so its switches are not
+    /// known.
+    AddonReadFailed,
+    /// The item played is not a movie, an episode or a stream: music, for one.
+    NotVideo,
 }
 
 /// Whether the switch is on.
@@ -220,7 +241,9 @@ pub fn cap_bytes(cfg: &api::ServerConfiguration) -> u64 {
         .trickplay_cache_size_mb
         .unwrap_or(1024)
         .max(MIN_CACHE_MB);
-    u64::try_from(mb).unwrap_or(0) * 1024 * 1024
+    u64::try_from(mb)
+        .unwrap_or(0)
+        .saturating_mul(1024 * 1024)
 }
 
 /// How long a set is kept after it was last shown: `None` never deletes by
@@ -401,12 +424,31 @@ pub fn eligible_row(
     if hls_container || hls_url {
         return Err(Ineligible::Hls);
     }
+    length_ok(runtime_s)
+}
+
+/// Whether a length in whole seconds gets pictures. A pass ([`eligible_row`])
+/// and the `Trickplay` field ([`manifest_entry`]) both judge by it, so a file
+/// a few tenths of a second past a limit is judged the same way by both.
+fn length_ok(runtime_s: Option<u64>) -> Result<(), Ineligible> {
     match runtime_s {
         None => Err(Ineligible::NoRuntime),
         Some(s) if s < MIN_RUNTIME_SECS => Err(Ineligible::TooShort),
         Some(s) if s > MAX_RUNTIME_SECS => Err(Ineligible::TooLong),
         Some(_) => Ok(()),
     }
+}
+
+/// Whether a stored item of this kind may get pictures: a movie, an episode,
+/// or a stream or stream group (see [`manifest`]). Never music.
+pub fn kind_has_pictures(kind: &db::MediaKind) -> bool {
+    matches!(
+        kind,
+        db::MediaKind::Movie
+            | db::MediaKind::Episode
+            | db::MediaKind::Stream
+            | db::MediaKind::StreamGroup
+    )
 }
 
 /// Whether an addon's own switch and service list let a stream get pictures.
@@ -657,11 +699,7 @@ fn manifest_entry(
     ticks: Option<i64>,
 ) -> Option<HashMap<String, api::TrickplayInfoDto>> {
     let ticks = ticks.filter(|t| *t > 0)?;
-    let secs = ticks / TICKS_PER_SEC;
-    if secs < MIN_RUNTIME_SECS as i64 || ticks > MAX_RUNTIME_SECS as i64 * TICKS_PER_SEC
-    {
-        return None;
-    }
+    length_ok(u64::try_from(ticks / TICKS_PER_SEC).ok()).ok()?;
     let info = api::TrickplayInfoDto {
         width: WIDTH as i32,
         height: HEIGHT as i32,
@@ -799,7 +837,12 @@ pub fn pass_args(input: &str, out_dir: &Path, start_sheet: u32) -> Vec<String> {
          pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,\
          tile={TILE_WIDTH}x{TILE_HEIGHT}"
     );
-    let output = out_dir
+    // ffmpeg reads the whole name as a pattern: a `%` in the folder's path is
+    // written `%%` so it stays a plain character.
+    let folder = out_dir
+        .to_string_lossy()
+        .replace('%', "%%");
+    let output = Path::new(&folder)
         .join("%d.jpg")
         .to_string_lossy()
         .into_owned();
@@ -1262,10 +1305,21 @@ enum RunEnd {
     NoJump,
     /// It started part way and found the file already over.
     Nothing,
+    /// It reached the end of the file with exit 0, but ffmpeg wrote a line
+    /// none of the tables below knows (see [`unknown_line`]). That may be a
+    /// source given up on in words the tables lack, so the last sheet may be
+    /// partly filled or missing: the end is not marked.
+    Unclean,
     Failed,
 }
 
-/// The exit status ffmpeg 7 gives when its input ended before any picture
+// The tables below were written from ffmpeg's source (fftools, and
+// libavformat's http and matroska code) and from runs of the jellyfin-ffmpeg
+// this server's image installs (`docker/Dockerfile`; the desktop app's
+// `FFMPEG_MAJOR`). Another ffmpeg may word its lines differently; a line a
+// table lacks then never marks the end of a file (see `RunEnd::Unclean`).
+
+/// The exit status ffmpeg gives when its input ended before any picture
 /// reached the sheet encoder, as when a run starts past the end of the file:
 /// the encoder cannot be opened without a picture, so it ends with
 /// AVERROR(EINVAL), -22, which is 234 on Unix (its low byte) and -22 on
@@ -1273,7 +1327,7 @@ enum RunEnd {
 /// is read by its status.
 const EMPTY_END_STATUS: [i32; 2] = [234, -22];
 
-/// What ffmpeg 7 writes at `-loglevel error` with [`EMPTY_END_STATUS`] when
+/// What ffmpeg writes at `-loglevel error` with [`EMPTY_END_STATUS`] when
 /// no picture reached the output before its input ended: the encoder could
 /// not open (fftools/ffmpeg_enc.c), or nothing was muxed (fftools/ffmpeg_mux.c
 /// of_write_trailer); both end with AVERROR(EINVAL).
@@ -1282,13 +1336,19 @@ const EMPTY_END_LINES: [&str; 2] = [
     "Nothing was written into output file",
 ];
 
+/// What ffmpeg writes at `-loglevel error` at a clean end of a file read over
+/// HTTP, from a source that closes the request at the file's very end.
+const HARMLESS_END_LINES: [&str; 2] =
+    ["Error reading HTTP response", "File ended prematurely"];
+
 /// What ffmpeg writes at `-loglevel error` when its input failed rather than
-/// ended: a read error it gave up on after its reconnects (which ffmpeg 7
-/// then treats as the end of the input, so a run that wrote nothing exits
-/// with [`EMPTY_END_STATUS`] all the same), an answer cut short of its
-/// length, an HTTP error status, or a connection that failed. "Error reading
-/// HTTP response" is not one: a source that closes a request at the file's
-/// very end gives it before a clean end.
+/// ended: a read error it gave up on after its reconnects (which ffmpeg then
+/// treats as the end of the input, so a run that wrote nothing exits with
+/// [`EMPTY_END_STATUS`] all the same), an answer cut short of its length, an
+/// HTTP error status, or a connection that failed. "Error reading HTTP
+/// response" is not one (see [`HARMLESS_END_LINES`]). Of these, "Failed to
+/// reconnect", "Server returned" other than a 404, the three "Connection"
+/// lines and "Error opening input" have no captured run behind them.
 const SOURCE_ERRORS: [&str; 10] = [
     "Error during demuxing",
     "Read error at pos",
@@ -1360,12 +1420,147 @@ fn source_gave_up(result: &RunResult) -> bool {
         })
 }
 
+/// Every line the tables know: [`SOURCE_ERRORS`] (which hold
+/// [`GAVE_UP_ERRORS`]), [`EMPTY_END_LINES`] and [`HARMLESS_END_LINES`].
+fn known_lines() -> impl Iterator<Item = &'static str> {
+    let tables: [&'static [&'static str]; 3] =
+        [&SOURCE_ERRORS, &EMPTY_END_LINES, &HARMLESS_END_LINES];
+    tables
+        .into_iter()
+        .flatten()
+        .copied()
+}
+
+/// Whether ffmpeg wrote a line that holds none of [`known_lines`].
+fn unknown_line(result: &RunResult) -> bool {
+    result
+        .stderr
+        .lines()
+        .any(|line| {
+            !line
+                .trim()
+                .is_empty()
+                && !known_lines().any(|known| line.contains(known))
+        })
+}
+
+/// What a run keeps of ffmpeg's stderr, taken line by line as it arrives, so
+/// a flood of lines holds a bounded amount: the first line holding each of
+/// [`known_lines`], however early it came, so the judging of the run
+/// ([`source_failed`], [`source_gave_up`], [`ended_empty`]) sees it; the
+/// first line holding none of them, so [`unknown_line`] sees one; and the
+/// last [`STDERR_TAIL_BYTES`] of the rest, for the log.
+#[derive(Debug, Default)]
+struct StderrKept {
+    noted: Vec<String>,
+    seen: HashSet<&'static str>,
+    unknown_seen: bool,
+    tail: std::collections::VecDeque<String>,
+    tail_bytes: usize,
+}
+
+impl StderrKept {
+    fn push(&mut self, line: &str) {
+        let line = line.trim_end();
+        if line
+            .trim()
+            .is_empty()
+        {
+            return;
+        }
+        let matched: Vec<&'static str> = known_lines()
+            .filter(|known| line.contains(known))
+            .collect();
+        let noted = if matched.is_empty() {
+            !std::mem::replace(&mut self.unknown_seen, true)
+        } else {
+            matched
+                .into_iter()
+                .fold(false, |new, known| {
+                    self.seen
+                        .insert(known)
+                        || new
+                })
+        };
+        if noted {
+            self.noted
+                .push(line.to_string());
+            return;
+        }
+        self.tail_bytes += line.len() + 1;
+        self.tail
+            .push_back(line.to_string());
+        while self.tail_bytes > STDERR_TAIL_BYTES {
+            let Some(old) = self
+                .tail
+                .pop_front()
+            else {
+                break;
+            };
+            self.tail_bytes -= old.len() + 1;
+        }
+    }
+
+    /// The lines kept, the noted ones first, one a line.
+    fn text(self) -> String {
+        let mut out = String::new();
+        for line in self
+            .noted
+            .iter()
+            .chain(
+                self.tail
+                    .iter(),
+            )
+        {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Reads ffmpeg's stderr to its end into a [`StderrKept`]. A line ends at a
+/// newline or a carriage return; only its first [`STDERR_LINE_BYTES`] are
+/// kept, so a line that never ends holds no more than that.
+async fn read_stderr<S>(mut stderr: S) -> String
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut kept = StderrKept::default();
+    let mut line: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match stderr
+            .read(&mut buf)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &byte in &buf[..n] {
+            if byte == b'\n' || byte == b'\r' {
+                kept.push(&String::from_utf8_lossy(&line));
+                line.clear();
+            } else if line.len() < STDERR_LINE_BYTES {
+                line.push(byte);
+            }
+        }
+    }
+    if !line.is_empty() {
+        kept.push(&String::from_utf8_lossy(&line));
+    }
+    kept.text()
+}
+
 /// Judges a run. `End` needs ffmpeg to have ended by itself, and either exit
 /// 0 with the count's last sheet or the sheet before it (a last sheet may
 /// never come) and no sign that it gave up on its source (a source cut off
 /// there exits 0 too, having flushed a partly filled sheet; see
 /// [`GAVE_UP_ERRORS`]), or no sheet from a run that started at the last (see
-/// [`ended_empty`]). A run that ends short of that by itself is a
+/// [`ended_empty`]). Such a run with exit 0 and a line the tables do not know
+/// is `Unclean` instead. A run that ends short of that by itself is a
 /// failure, as a source cut off part way also exits 0, except one that
 /// started part way and ended empty: the file ends before that place.
 fn run_end(result: &RunResult, run: Run, pictures: u64) -> RunEnd {
@@ -1388,6 +1583,11 @@ fn run_end(result: &RunResult, run: Run, pictures: u64) -> RunEnd {
         }
     };
     if reached {
+        // With `EMPTY_END_STATUS`, the other lines ffmpeg writes are those
+        // of a run that found no picture (see `ended_empty`).
+        if result.exit_ok && unknown_line(result) {
+            return RunEnd::Unclean;
+        }
         return RunEnd::End;
     }
     if result.no_first_sheet {
@@ -1464,6 +1664,9 @@ fn free_bytes(path: &Path) -> Option<u64> {
     Some(free)
 }
 
+/// Not known off Unix (the Windows build): the 2 GB free-disk stop
+/// ([`MIN_FREE_BYTES`]) then never fires, and the admin page says it holds
+/// on Linux and macOS only.
 #[cfg(not(unix))]
 fn free_bytes(_path: &Path) -> Option<u64> {
     None
@@ -1481,6 +1684,9 @@ fn lower_priority(pid: u32) {
     }
 }
 
+/// Does nothing off Unix (the Windows build): ffmpeg runs at normal
+/// priority there, and the admin page says low priority on Linux and macOS
+/// only.
 #[cfg(not(unix))]
 fn lower_priority(_pid: u32) {}
 
@@ -1495,6 +1701,9 @@ fn kill_pid(pid: u32) {
     }
 }
 
+/// Does nothing off Unix (the Windows build): there `kill_all` has no last
+/// resort for a pass that does not stop within [`KILL_WAIT`], and only
+/// `kill_on_drop` and the stop each run is sent stand behind it.
 #[cfg(not(unix))]
 fn kill_pid(_pid: u32) {}
 
@@ -1524,6 +1733,19 @@ fn drop_on_trial(plan: &PassPlan, dir: &Path, sheets: &[u32]) {
         sheets = sheets.len(),
         "trick play: another version's read ended short; its pictures are made again from the next"
     );
+}
+
+/// Deletes what another version made in this slot, its sheets on trial and
+/// its rough pictures, when its read is stopped before its length was
+/// checked. Nothing for the version played.
+fn drop_stand_in(plan: &PassPlan, dir: &Path, on_trial: &[u32]) {
+    if plan
+        .other_version
+        .is_some()
+    {
+        drop_on_trial(plan, dir, on_trial);
+        drop_rough(dir);
+    }
 }
 
 /// Deletes the sheet written last, if it was written at or after `since`,
@@ -1688,8 +1910,10 @@ pub fn prune(
     }
 }
 
-/// The prune at server start. No pass can be running then. With the switch
-/// off, every picture is deleted.
+/// The prune at server start, run while holding the pass slot (see
+/// [`prune_at_startup`]), so no pass runs meanwhile. With the switch off,
+/// every set is deleted: only folders named by an id, then `root` itself if
+/// nothing else is left in it.
 pub fn prune_on_start(
     root: &Path,
     enabled: bool,
@@ -1701,7 +1925,22 @@ pub fn prune_on_start(
         return;
     }
     if !enabled {
-        let _ = std::fs::remove_dir_all(root);
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let named_by_id = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| Uuid::parse_str(name).is_ok());
+                let is_dir = entry
+                    .file_type()
+                    .is_ok_and(|t| t.is_dir());
+                if named_by_id && is_dir {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        // Fails, and keeps it, while anything else is in it.
+        let _ = std::fs::remove_dir(root);
         return;
     }
     prune(root, cap_bytes, keep_for, &HashSet::new(), now);
@@ -1733,16 +1972,25 @@ pub async fn refresh_addon_rules(ctx: &AppContext) {
     }
 }
 
-/// [`prune_on_start`] with the saved settings.
-pub async fn prune_at_startup(ctx: &AppContext) {
-    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+/// [`prune_on_start`] with `cfg`, the settings start-up has already read
+/// strictly: a database error read here as "off" would delete every set. It
+/// holds the pass slot while it works, so it never deletes from a set a pass
+/// is writing, however long it takes.
+pub async fn prune_at_startup(ctx: &AppContext, cfg: &api::ServerConfiguration) {
     let root = root_dir(
         &ctx.config
             .data_dir,
     );
-    let on = enabled(&cfg);
-    let cap = cap_bytes(&cfg);
-    let keep = keep_for(&cfg);
+    let on = enabled(cfg);
+    let cap = cap_bytes(cfg);
+    let keep = keep_for(cfg);
+    let _slot = ctx
+        .sessions
+        .trickplay
+        .inner
+        .slots
+        .acquire()
+        .await;
     let _ = tokio::task::spawn_blocking(move || {
         prune_on_start(&root, on, cap, keep, SystemTime::now())
     })
@@ -1862,6 +2110,20 @@ async fn resolve_plan(
         play.media_source_id,
     )
     .await;
+    // The item is judged before any stream is looked for, so a play of
+    // music never reaches a lookup. A missing row is judged by its stream.
+    let item = db::Media::get_by_id(&ctx.db, &owner)
+        .await
+        .ok()
+        .flatten();
+    if let Some(item) = &item {
+        if item.is_live() {
+            return Err(Ineligible::LiveTv);
+        }
+        if !kind_has_pictures(&item.kind) {
+            return Err(Ineligible::NotVideo);
+        }
+    }
     let selected = StreamService::selected_stream_id(
         ctx,
         Some(
@@ -1906,16 +2168,6 @@ async fn resolve_plan(
         .await
         .map_err(|_| Ineligible::NoStream)?,
     };
-    let item = db::Media::get_by_id(&ctx.db, &owner)
-        .await
-        .ok()
-        .flatten();
-    if item
-        .as_ref()
-        .is_some_and(db::Media::is_live)
-    {
-        return Err(Ineligible::LiveTv);
-    }
     let info = stream
         .stream_info
         .as_ref()
@@ -1927,10 +2179,7 @@ async fn resolve_plan(
     );
     eligible_row(&stream, info, runtime)?;
     let addon = match info.addon_id {
-        Some(id) => Addon::get(&ctx.db, id)
-            .await
-            .ok()
-            .flatten(),
+        Some(id) => addon_from_read(Addon::get(&ctx.db, id).await)?,
         None => None,
     };
     let refused = eligible_pass(addon.as_ref(), info).err();
@@ -1987,8 +2236,8 @@ async fn resolve_plan(
             .size
             .and_then(|s| u64::try_from(s).ok())
             .filter(|s| *s > 0),
-        cap_bytes: cap_bytes(&cfg).saturating_sub(estimate),
-        keep_for: keep_for(&cfg),
+        estimate,
+        played: info.clone(),
         rough,
         db: Some(
             ctx.db
@@ -1998,6 +2247,21 @@ async fn resolve_plan(
         other_version: None,
     };
     read_other_if_refused(plan, refused)
+}
+
+/// The addon a stream names, from its read: an error refuses the pass, since
+/// that addon's switches are then not known. A missing row (the addon was
+/// deleted) is no addon, and the stream is judged by its row alone.
+fn addon_from_read(
+    read: anyhow::Result<Option<Addon>>,
+) -> Result<Option<Addon>, Ineligible> {
+    match read {
+        Ok(addon) => Ok(addon),
+        Err(error) => {
+            warn!(%error, "trick play: could not read the stream's addon");
+            Err(Ineligible::AddonReadFailed)
+        }
+    }
 }
 
 /// `plan` as it reads the version played, or, when its addon says not to read
@@ -2118,14 +2382,19 @@ pub(crate) struct PassPlan {
     pub pictures: u64,
     /// The file's size in bytes, when the source listed it.
     pub size: Option<u64>,
-    /// Disk allowance left for other sets once this one is made.
-    pub cap_bytes: u64,
-    /// See [`keep_for`].
-    pub keep_for: Option<Duration>,
+    /// The disk this set is expected to take, kept free of other sets. The
+    /// cap and the keep time themselves are read when the pass takes the
+    /// slot, so a save after the play started counts.
+    pub estimate: u64,
+    /// The listing of the version played: its addon and service, checked
+    /// against the addon rules as they are at slot entry and while it is
+    /// read (see [`addon_ok`]).
+    pub played: StreamInfo,
     /// Make rough pictures first (see [`rough_first`]).
     pub rough: bool,
-    /// Where the switches are read again just before the pass starts, since a
-    /// queued pass may wait long after its play started. `None` in tests.
+    /// Where the settings are read again when the pass takes the slot, since
+    /// a queued pass may wait long after its play started, and again while it
+    /// runs, so a switch turned off stops it. `None` in most tests.
     pub db: Option<sqlx::SqlitePool>,
     /// Other versions still to try, in order, when the stream read cannot be
     /// (see [`other_versions`]). Empty with `TrickplayOtherVersion` off.
@@ -2147,6 +2416,18 @@ impl PassPlan {
             .and_then(|s| u64::try_from(s).ok())
             .filter(|s| *s > 0);
         self.other_version = Some(source.info);
+    }
+
+    /// Reads what the plan of a play that joined this pass reads, from now
+    /// on (see [`TrickplayPasses::next_joined`]): that play's version, or the
+    /// version standing in for it. The set and its picture count are the
+    /// same, since that play joined this set.
+    fn read_joined(&mut self, joined: PassPlan) {
+        self.stream_id = joined.stream_id;
+        self.input = joined.input;
+        self.size = joined.size;
+        self.played = joined.played;
+        self.other_version = joined.other_version;
     }
 }
 
@@ -2186,6 +2467,7 @@ pub(crate) struct RunResult {
     pub reached_goal: bool,
     /// Stopped because `first_sheet_within` passed with no sheet.
     pub no_first_sheet: bool,
+    /// What ffmpeg wrote to stderr, as [`StderrKept`] keeps it.
     pub stderr: String,
 }
 
@@ -2311,8 +2593,6 @@ async fn source_size(input: String) -> Option<u64> {
 /// One rough picture by ffmpeg. Judged by its file alone: whole once ffmpeg
 /// has ended means made, whatever the exit status.
 async fn run_grab(job: GrabJob, mut cancel: oneshot::Receiver<()>) -> Grab {
-    use tokio::io::AsyncReadExt;
-
     let mut cmd = tokio::process::Command::new(crate::tools::ffmpeg());
     cmd.hide_console();
     cmd.kill_on_drop(true);
@@ -2335,15 +2615,7 @@ async fn run_grab(job: GrabJob, mut cancel: oneshot::Receiver<()>) -> Grab {
     let stderr_task = child
         .stderr
         .take()
-        .map(|mut stderr| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = stderr
-                    .read_to_end(&mut buf)
-                    .await;
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
+        .map(|stderr| tokio::spawn(read_stderr(stderr)));
     let mut cancelled = false;
     let exited = tokio::select! {
         status = child.wait() => Some(status.ok().and_then(|s| s.code())),
@@ -2387,9 +2659,104 @@ async fn run_grab(job: GrabJob, mut cancel: oneshot::Receiver<()>) -> Grab {
     }
 }
 
-async fn run_ffmpeg(job: PassJob, mut cancel: oneshot::Receiver<()>) -> RunResult {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+/// What [`read_progress`] saw of a run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RunProgress {
+    /// The last `frame=` value, which counts sheets.
+    made_sheets: u64,
+    /// A stop came on `cancel`.
+    cancelled: bool,
+    low_disk: bool,
+    reached_goal: bool,
+    no_first_sheet: bool,
+    /// ffmpeg wrote its last progress block (`progress=end`): its output
+    /// had ended, and may hold a partly filled last sheet.
+    ended: bool,
+}
 
+impl RunProgress {
+    /// A stop that came after ffmpeg's last progress block: its output had
+    /// already ended, so its last sheet may be partly filled and goes (see
+    /// [`RunResult::ended_itself`]).
+    fn ended_before_stop(&self) -> bool {
+        self.cancelled && self.ended
+    }
+}
+
+/// Reads a run's `-progress` lines from `stdout` until ffmpeg closes it, a
+/// stop comes on `cancel`, the run reaches its goal, its first sheet is late
+/// or the disk runs low. Lines already written are read before a stop is
+/// looked at (`biased`), so a stop that comes with ffmpeg's last progress
+/// block never hides the count of a last, partly filled sheet.
+async fn read_progress<B>(
+    stdout: B,
+    job: &PassJob,
+    cancel: &mut oneshot::Receiver<()>,
+) -> RunProgress
+where
+    B: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut seen = RunProgress::default();
+    let mut next_check = 10;
+    let first_sheet_by = job
+        .first_sheet_within
+        .map(|wait| tokio::time::Instant::now() + wait);
+    let mut lines = stdout.lines();
+    loop {
+        tokio::select! {
+            biased;
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else {
+                    break;
+                };
+                // Each block of progress lines ends with `progress=continue`
+                // or `progress=end`. A sheet counted in a `continue` block
+                // was a full one: a partly filled sheet is only written at
+                // the end of the input.
+                if line.trim() == "progress=end" {
+                    seen.ended = true;
+                }
+                if line.trim() == "progress=continue"
+                    && job
+                        .stop_after
+                        .is_some_and(|goal| seen.made_sheets >= goal)
+                {
+                    seen.reached_goal = true;
+                    break;
+                }
+                let Some(n) = progress_frame(&line) else {
+                    continue;
+                };
+                seen.made_sheets = n;
+                job.made
+                    .store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::SeqCst);
+                if seen.made_sheets >= next_check {
+                    next_check = seen.made_sheets + 10;
+                    let free = free_bytes(&job.out_dir);
+                    if free.is_some_and(|b| b < job.min_free_bytes) {
+                        seen.low_disk = true;
+                        break;
+                    }
+                }
+            }
+            _ = &mut *cancel => {
+                seen.cancelled = true;
+                break;
+            }
+            _ = tokio::time::sleep_until(
+                first_sheet_by.unwrap_or_else(tokio::time::Instant::now)
+            ), if first_sheet_by.is_some() && seen.made_sheets == 0 => {
+                seen.no_first_sheet = true;
+                break;
+            }
+        }
+    }
+    seen
+}
+
+async fn run_ffmpeg(job: PassJob, mut cancel: oneshot::Receiver<()>) -> RunResult {
     let mut cmd = tokio::process::Command::new(crate::tools::ffmpeg());
     cmd.hide_console();
     cmd.kill_on_drop(true);
@@ -2414,78 +2781,27 @@ async fn run_ffmpeg(job: PassJob, mut cancel: oneshot::Receiver<()>) -> RunResul
     let stderr_task = child
         .stderr
         .take()
-        .map(|mut stderr| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = stderr
-                    .read_to_end(&mut buf)
-                    .await;
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
+        .map(|stderr| tokio::spawn(read_stderr(stderr)));
 
-    let mut made_sheets = 0;
-    let mut next_check = 10;
-    let mut cancelled = false;
-    let mut low_disk = false;
-    let mut reached_goal = false;
-    let mut no_first_sheet = false;
-    let first_sheet_by = job
-        .first_sheet_within
-        .map(|wait| tokio::time::Instant::now() + wait);
-    if let Some(stdout) = child
+    let seen = match child
         .stdout
         .take()
     {
-        let mut lines = tokio::io::BufReader::new(stdout).lines();
-        loop {
-            tokio::select! {
-                _ = &mut cancel => {
-                    cancelled = true;
-                    break;
-                }
-                _ = tokio::time::sleep_until(
-                    first_sheet_by.unwrap_or_else(tokio::time::Instant::now)
-                ), if first_sheet_by.is_some() && made_sheets == 0 => {
-                    no_first_sheet = true;
-                    break;
-                }
-                line = lines.next_line() => {
-                    let Ok(Some(line)) = line else {
-                        break;
-                    };
-                    // Each block of progress lines ends with `progress=continue`
-                    // or `progress=end`. A sheet counted in a `continue` block
-                    // was a full one: a partly filled sheet is only written at
-                    // the end of the input.
-                    if line.trim() == "progress=continue"
-                        && job
-                            .stop_after
-                            .is_some_and(|goal| made_sheets >= goal)
-                    {
-                        reached_goal = true;
-                        break;
-                    }
-                    let Some(n) = progress_frame(&line) else {
-                        continue;
-                    };
-                    made_sheets = n;
-                    job.made
-                        .store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::SeqCst);
-                    if made_sheets >= next_check {
-                        next_check = made_sheets + 10;
-                        let free = free_bytes(&job.out_dir);
-                        if free.is_some_and(|b| b < job.min_free_bytes) {
-                            low_disk = true;
-                            break;
-                        }
-                    }
-                }
-            }
+        Some(stdout) => {
+            read_progress(tokio::io::BufReader::new(stdout), &job, &mut cancel).await
         }
-    }
+        None => RunProgress::default(),
+    };
+    let mut ended_itself = seen.ended_before_stop();
+    let RunProgress {
+        made_sheets,
+        mut cancelled,
+        low_disk,
+        reached_goal,
+        no_first_sheet,
+        ..
+    } = seen;
 
-    let mut ended_itself = false;
     let mut exit_code = None;
     let exit_ok = if cancelled || low_disk || reached_goal || no_first_sheet {
         let _ = child.start_kill();
@@ -2551,6 +2867,8 @@ struct Limits {
     quiet_waiting: Duration,
     quiet_alone: Duration,
     seek_wait: Duration,
+    no_jump_wait: Duration,
+    stall_wait: Duration,
     follow_every: Duration,
     max_follows: u32,
     rough_budget: Duration,
@@ -2570,6 +2888,8 @@ impl Default for Limits {
             quiet_waiting: QUIET_WAITING,
             quiet_alone: QUIET_ALONE,
             seek_wait: SEEK_WAIT,
+            no_jump_wait: NO_JUMP_WAIT,
+            stall_wait: STALL_WAIT,
             follow_every: FOLLOW_EVERY,
             max_follows: MAX_FOLLOWS,
             rough_budget: ROUGH_BUDGET,
@@ -2614,6 +2934,13 @@ struct Pass {
     /// The picture count the set is keyed by, once a play of it is resolved;
     /// `None` for a stream's own set.
     pictures: Option<u64>,
+    /// The play session id and plan of each play that joined the running
+    /// job, by the stream it would read: its own version, or the one standing
+    /// in for it. The job reads these when its own source fails (see
+    /// [`TrickplayPasses::next_joined`]). A play's entry goes when it leaves
+    /// the set (see [`TrickplayPasses::leave`]), so no source is read for a
+    /// play that ended.
+    joined: Vec<(String, PassPlan)>,
 }
 
 #[derive(Default)]
@@ -2624,14 +2951,17 @@ struct State {
     selection: HashMap<(Uuid, String), Uuid>,
     /// When each stream that failed may be read again. By stream, not set: a
     /// dead link on one version does not hold back another version of the
-    /// same set. Kept in memory only.
+    /// same set, which a play that joined the pass may be playing. Kept in
+    /// memory only.
     failed_until: HashMap<Uuid, Instant>,
-    /// Streams whose source gave no sheet in time after a jump: read from
-    /// their start until the server restarts. By stream, as `failed_until`.
-    no_jump: HashSet<Uuid>,
-    /// Streams whose rough picture at the end of the file timed out: no rough
-    /// stage until the server restarts. Runs still follow `no_jump` alone.
-    no_rough: HashSet<Uuid>,
+    /// Until when each stream whose source gave no sheet in time after a jump
+    /// is read from its start ([`NO_JUMP_WAIT`]). By stream, as
+    /// `failed_until`.
+    no_jump: HashMap<Uuid, Instant>,
+    /// Until when each stream whose rough picture at the end of the file
+    /// timed out gets no rough stage ([`NO_JUMP_WAIT`]). Runs still follow
+    /// `no_jump` alone.
+    no_rough: HashMap<Uuid, Instant>,
     touched_at: HashMap<Uuid, Instant>,
     next_job: u64,
 }
@@ -2657,7 +2987,8 @@ pub(crate) enum Begin {
     FailedRecently,
     /// A new pass was queued.
     Queued,
-    /// The play joined a pass already queued or running.
+    /// The play joined a pass already queued or running. The stream its plan
+    /// reads is kept, for the pass to read should its own source fail.
     Joined,
 }
 
@@ -2675,6 +3006,12 @@ enum Stopped {
     StoodDown,
     /// The viewer moved to this sheet, which has no picture yet.
     Moved(u32),
+    /// No new sheet for [`STALL_WAIT`]: the source stopped sending.
+    Stalled,
+    /// The settings or the addon rules no longer let the stream be read (see
+    /// [`TrickplayPasses::refusal`]); the slot ends this way, a stream
+    /// not to be read as `Failed` (see [`refused_after_open`]).
+    Refused(SlotEnd),
 }
 
 /// How the rough stage of a pass ended (see [`TrickplayPasses::rough_stage`]).
@@ -2689,11 +3026,15 @@ enum RoughEnd {
     /// Too many pictures failed in a row.
     Failures,
     /// The picture at the end of the file timed out: no rough stage for this
-    /// source again.
+    /// source for [`NO_JUMP_WAIT`].
     NoJump,
     /// Nobody has watched it lately: the pass gives way.
     StoodDown,
     Cancelled,
+    /// The settings or the addon rules no longer let the stream be read (see
+    /// [`TrickplayPasses::refusal`]); the slot ends this way, a stream
+    /// not to be read as `Failed` (see [`refused_after_open`]).
+    Refused(SlotEnd),
 }
 
 /// How a job's turn in the slot ended.
@@ -2704,7 +3045,8 @@ enum SlotEnd {
     Cancelled,
     /// Nobody has watched it lately: it waits to be watched again.
     StoodDown,
-    /// Its source was opened and could not be read.
+    /// Its source was opened and could not be read, or may no longer be (see
+    /// [`refused_after_open`]).
     Failed,
     /// Its source failed recently and was not opened.
     Skipped,
@@ -2774,6 +3116,94 @@ impl TrickplayPasses {
         info.addon_id
             .and_then(|id| rules.get(&id))
             .is_some_and(|rule| rule.allows(info))
+    }
+
+    /// Puts one addon's rule in the snapshot, from its row as just saved, so
+    /// a reload or a refill that fails afterwards cannot leave it stale.
+    pub fn set_addon_rule(&self, addon: &Addon) {
+        let mut rules = self
+            .inner
+            .addon_rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::make_mut(&mut *rules).insert(addon.id, AddonRule::new(addon));
+    }
+
+    /// Takes a deleted addon's rule out of the snapshot.
+    pub fn drop_addon_rule(&self, addon_id: Uuid) {
+        let mut rules = self
+            .inner
+            .addon_rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::make_mut(&mut *rules).remove(&addon_id);
+    }
+
+    /// Why the stream `plan` reads may not be read now, by the settings `cfg`
+    /// and the addon rules as they are now; `None` while it may. The version
+    /// played follows [`addon_ok`], so a stream with no addon stays allowed.
+    /// The switches are judged only with `cfg`: `None` where the settings
+    /// were not read. Another version's addon is judged by the rules alone,
+    /// so a failed settings read does not skip it; a plan with no database
+    /// (most tests) skips it, as its stand-ins name no addon.
+    fn refusal(
+        &self,
+        plan: &PassPlan,
+        cfg: Option<&api::ServerConfiguration>,
+    ) -> Option<SlotEnd> {
+        if let Some(cfg) = cfg {
+            let other_off = plan
+                .other_version
+                .is_some()
+                && !other_version(cfg);
+            if !enabled(cfg) || other_off {
+                info!(
+                    set_id = %plan.set_id,
+                    stream_id = %plan.stream_id,
+                    "trick play: switched off; not reading"
+                );
+                return Some(SlotEnd::Over);
+            }
+        }
+        if (cfg.is_some()
+            || plan
+                .db
+                .is_some())
+            && let Some(info) = &plan.other_version
+            && !self.addon_still_allows(info)
+        {
+            info!(
+                set_id = %plan.set_id,
+                stream_id = %plan.stream_id,
+                "trick play: another version's addon no longer allows previews"
+            );
+            return Some(SlotEnd::Skipped);
+        }
+        if plan
+            .other_version
+            .is_none()
+            && !addon_ok(&self.addon_rules(), &plan.played)
+        {
+            info!(
+                set_id = %plan.set_id,
+                stream_id = %plan.stream_id,
+                "trick play: this version's addon no longer allows previews"
+            );
+            return Some(SlotEnd::Skipped);
+        }
+        None
+    }
+
+    /// [`Self::refusal`] with the settings read now. A failed read judges by
+    /// the addon rules alone, so a passing database error stops nothing.
+    async fn refused_now(&self, plan: &PassPlan) -> Option<SlotEnd> {
+        let cfg = match &plan.db {
+            Some(pool) => db::Settings::get_config(pool)
+                .await
+                .ok(),
+            None => None,
+        };
+        self.refusal(plan, cfg.as_ref())
     }
 
     /// Records a play session, before its file is known. The set an earlier
@@ -2906,6 +3336,8 @@ impl TrickplayPasses {
         };
         pass.sessions
             .remove(play_session_id);
+        pass.joined
+            .retain(|(session, _)| session != play_session_id);
         if pass
             .sessions
             .is_empty()
@@ -2975,7 +3407,8 @@ impl TrickplayPasses {
     /// Whether `device_id` has a play tied to `set_id` that is at least the
     /// start delay old. Until then a set with a missing sheet is served only
     /// below the gap, so an app that fetches every sheet when play starts and
-    /// strings them together in order gets a clean run from sheet 0.
+    /// strings them together in order (Findroid 1.2.0's `getTrickplay` loop)
+    /// gets a clean run from sheet 0.
     pub fn open_for(&self, set_id: Uuid, device_id: &str) -> bool {
         let delay = self
             .inner
@@ -3078,32 +3511,94 @@ impl TrickplayPasses {
         false
     }
 
-    /// Whether a run of this stream may start part way into the file.
-    fn can_jump(&self, stream_id: Uuid) -> bool {
-        !self
-            .lock()
-            .no_jump
-            .contains(&stream_id)
+    /// Moves `plan` on to the stream a play that joined job `job_id` would
+    /// read (see [`Self::queue`]): the first that is not the stream `plan`
+    /// reads, has not failed recently and has no folder of its own, dropping
+    /// those passed over. Only plays still on the set are listed (see
+    /// [`Self::leave`]). It is then judged at slot entry like any source
+    /// (see [`Self::refusal`]), so an addon not to be read stays unread.
+    /// False when none is left.
+    fn next_joined(&self, plan: &mut PassPlan, job_id: u64) -> bool {
+        let now = Instant::now();
+        loop {
+            let joined = {
+                let mut st = self.lock();
+                let Some(pass) = st
+                    .by_set
+                    .get_mut(&plan.set_id)
+                    .filter(|pass| pass.job_id == job_id)
+                else {
+                    return false;
+                };
+                if pass
+                    .joined
+                    .is_empty()
+                {
+                    return false;
+                }
+                let (_, joined) = pass
+                    .joined
+                    .remove(0);
+                joined
+            };
+            if joined.stream_id == plan.stream_id
+                || self.failed_recently(joined.stream_id, now)
+                || set_dir(&plan.root, joined.stream_id).is_dir()
+            {
+                continue;
+            }
+            info!(
+                set_id = %plan.set_id,
+                stream_id = %joined.stream_id,
+                "trick play: reading the version another play of this set reads"
+            );
+            plan.read_joined(joined);
+            return true;
+        }
     }
 
+    /// Whether a run of this stream may start part way into the file.
+    fn can_jump(&self, stream_id: Uuid) -> bool {
+        let now = Instant::now();
+        let mut st = self.lock();
+        st.no_jump
+            .retain(|_, until| *until > now);
+        !st.no_jump
+            .contains_key(&stream_id)
+    }
+
+    /// Reads this stream from its start for [`NO_JUMP_WAIT`].
     fn mark_no_jump(&self, stream_id: Uuid) {
+        let until = Instant::now()
+            + self
+                .inner
+                .limits
+                .no_jump_wait;
         self.lock()
             .no_jump
-            .insert(stream_id);
+            .insert(stream_id, until);
     }
 
     /// Whether a pass over this stream may have a rough stage.
     fn can_rough(&self, stream_id: Uuid) -> bool {
-        !self
-            .lock()
-            .no_rough
-            .contains(&stream_id)
+        let now = Instant::now();
+        let mut st = self.lock();
+        st.no_rough
+            .retain(|_, until| *until > now);
+        !st.no_rough
+            .contains_key(&stream_id)
     }
 
+    /// No rough stage for this stream for [`NO_JUMP_WAIT`].
     fn mark_no_rough(&self, stream_id: Uuid) {
+        let until = Instant::now()
+            + self
+                .inner
+                .limits
+                .no_jump_wait;
         self.lock()
             .no_rough
-            .insert(stream_id);
+            .insert(stream_id, until);
     }
 
     /// The least quiet of a set's plays, each asked of `watch` outside the
@@ -3263,10 +3758,16 @@ impl TrickplayPasses {
         {
             return Begin::FailedRecently;
         }
-        self.queue(plan, runner, watch)
+        self.queue(play_session_id, plan, runner, watch)
     }
 
-    fn queue<R, W>(&self, plan: PassPlan, runner: Arc<R>, watch: W) -> Begin
+    fn queue<R, W>(
+        &self,
+        play_session_id: &str,
+        plan: PassPlan,
+        runner: Arc<R>,
+        watch: W,
+    ) -> Begin
     where
         R: PassRunner,
         W: Fn(&str, Uuid) -> Option<Watched> + Send + Sync + 'static,
@@ -3284,11 +3785,19 @@ impl TrickplayPasses {
             .cancel
             .is_some()
         {
+            // Kept, so the job can read this play's version should its own
+            // source fail, until this play leaves the set. One entry a play.
+            pass.joined
+                .retain(|(session, _)| session != play_session_id);
+            pass.joined
+                .push((play_session_id.to_string(), plan));
             return Begin::Joined;
         }
         let (cancel_tx, cancel_rx) = oneshot::channel();
         pass.cancel = Some(cancel_tx);
         pass.job_id = job_id;
+        pass.joined
+            .clear();
         let pid = pass
             .pid
             .clone();
@@ -3305,9 +3814,11 @@ impl TrickplayPasses {
     /// plays is watched, runs, gives way when nobody has watched it lately,
     /// and waits to be watched again. A cancel (the grace period, `expire`,
     /// `kill_all`) ends it at any point, and so does a run that ended by
-    /// itself. A source that could not be read is followed by the next of the
-    /// plan's other versions, which waits for the slot like any pass, until
-    /// [`MAX_SOURCES`] were read.
+    /// itself. A source that could not be read is followed by the version a
+    /// play that joined would read (see [`Self::next_joined`]), then by the
+    /// next of the plan's other versions, each waiting for the slot like any
+    /// pass, until [`MAX_SOURCES`] were read. A version played that was moved
+    /// to a folder of its own is followed by the joined plays' versions too.
     async fn run_job<R, W>(
         &self,
         mut plan: PassPlan,
@@ -3397,22 +3908,38 @@ impl TrickplayPasses {
                 SlotEnd::Failed => {
                     read += 1;
                     // The key check moved the version played to a folder of
-                    // its own: its plays no longer show the set.
-                    let moved = plan
-                        .other_version
-                        .is_none()
-                        && plan.set_id != plan.stream_id
-                        && set_dir(&plan.root, plan.stream_id).is_dir();
-                    if !moved && read < MAX_SOURCES && self.next_source(&mut plan) {
+                    // its own: its plays no longer show the set. A play that
+                    // joined still does, moved or not: the version it would
+                    // read comes first.
+                    let moved = moved_away(&plan);
+                    if read < MAX_SOURCES
+                        && (self.next_joined(&mut plan, job_id)
+                            || (!moved && self.next_source(&mut plan)))
+                    {
                         continue;
                     }
                 }
+                // Nothing was opened: a source refused after it was opened
+                // ends as `Failed` (see `refused_after_open`).
                 SlotEnd::Skipped => {
-                    if self.next_source(&mut plan) {
+                    if self.next_joined(&mut plan, job_id)
+                        || self.next_source(&mut plan)
+                    {
                         continue;
                     }
                 }
-                SlotEnd::Over | SlotEnd::Cancelled => {}
+                // The version played was longer than its stored length and
+                // was made in a folder of its own: the set itself is still
+                // to make for the plays that joined. That read counts.
+                SlotEnd::Over => {
+                    if moved_away(&plan) {
+                        read += 1;
+                        if read < MAX_SOURCES && self.next_joined(&mut plan, job_id) {
+                            continue;
+                        }
+                    }
+                }
+                SlotEnd::Cancelled => {}
             }
             break;
         }
@@ -3455,31 +3982,25 @@ impl TrickplayPasses {
         if self.failed_recently(plan.stream_id, Instant::now()) {
             return SlotEnd::Skipped;
         }
-        // Switched off while this pass waited: start nothing. The rough stage
-        // and another version follow their own switches as they are now, too.
-        let rough = match &plan.db {
-            Some(pool) => {
-                let cfg = db::Settings::get_config_or_default(pool).await;
-                let other_off = plan
-                    .other_version
-                    .is_some()
-                    && !other_version(&cfg);
-                if !enabled(&cfg) || other_off {
-                    return SlotEnd::Over;
-                }
-                if let Some(info) = &plan.other_version
-                    && !self.addon_still_allows(info)
-                {
-                    info!(
-                        set_id = %plan.set_id,
-                        stream_id = %plan.stream_id,
-                        "trick play: another version's addon no longer allows previews"
-                    );
-                    return SlotEnd::Skipped;
-                }
-                plan.rough && rough_first(&cfg)
-            }
-            None => plan.rough,
+        // Switched off, or its addon's previews turned off, while this pass
+        // waited: start nothing. The rough stage and another version follow
+        // their own switches as they are now, too, and the disk limits are
+        // the ones saved now, not those of when the play started.
+        let cfg = match &plan.db {
+            Some(pool) => Some(db::Settings::get_config_or_default(pool).await),
+            None => None,
+        };
+        if let Some(end) = self.refusal(plan, cfg.as_ref()) {
+            return end;
+        }
+        let (rough, cap, keep) = match &cfg {
+            Some(cfg) => (
+                plan.rough && rough_first(cfg),
+                cap_bytes(cfg).saturating_sub(plan.estimate),
+                keep_for(cfg),
+            ),
+            // No settings (tests): nothing is pruned by size or age.
+            None => (plan.rough, u64::MAX, None),
         };
         let plan = &PassPlan {
             rough,
@@ -3496,8 +4017,10 @@ impl TrickplayPasses {
         let root = plan
             .root
             .clone();
-        let cap = plan.cap_bytes;
-        let keep = plan.keep_for;
+        // `active` is a snapshot: a play that attaches to an old finished set
+        // just after it was taken can see that set deleted. That play's pass
+        // then normally makes it again, since `begin` looks for `done` only
+        // after its start delay.
         let _ = tokio::task::spawn_blocking(move || {
             prune(&root, cap, keep, &active, SystemTime::now())
         })
@@ -3573,6 +4096,11 @@ impl TrickplayPasses {
         let end = match stage {
             RoughEnd::Cancelled => SlotEnd::Cancelled,
             RoughEnd::StoodDown => SlotEnd::StoodDown,
+            RoughEnd::Refused(end) => {
+                // No sheet yet: a stand-in's rough pictures go.
+                drop_stand_in(plan, &dir, &[]);
+                refused_after_open(end)
+            }
             _ => {
                 self.run_pass(plan, runner, cancel, pid, watch, &mut dir)
                     .await
@@ -3587,7 +4115,7 @@ impl TrickplayPasses {
     /// stand-ins as they come (see [`ROUGH_COMPOSE_AT`]). It ends with every
     /// picture made, after [`ROUGH_BUDGET`], after [`ROUGH_MAX_FAILS`]
     /// failures in a row, when the picture at the end of the file times out
-    /// (the source then gets no rough stage again), when nobody has
+    /// (the source then gets no rough stage for [`NO_JUMP_WAIT`]), when nobody has
     /// watched the pass lately, or on a cancel. Rough pictures on disk are
     /// kept whichever way it ends.
     async fn rough_stage<R, W>(
@@ -3657,6 +4185,15 @@ impl TrickplayPasses {
                 end = RoughEnd::StoodDown;
                 break;
             }
+            // Switched off, or its addon's previews turned off, since the
+            // last picture.
+            if let Some(refused) = self
+                .refused_now(plan)
+                .await
+            {
+                end = RoughEnd::Refused(refused);
+                break;
+            }
             let wait = limits
                 .rough_seek_wait
                 .min(left);
@@ -3706,7 +4243,7 @@ impl TrickplayPasses {
                         set_id = %plan.set_id,
                         stream_id = %plan.stream_id,
                         "trick play: no rough picture in time at the end of the file; \
-                         no rough pictures for this source"
+                         no rough pictures for this source for a while"
                     );
                     end = RoughEnd::NoJump;
                     break;
@@ -3767,7 +4304,7 @@ impl TrickplayPasses {
         // for the next version to make (see `drop_on_trial`). Sheets it made
         // before standing down in an earlier slot are not counted.
         let mut on_trial: Vec<u32> = Vec::new();
-        for _ in 0..MAX_RUNS {
+        for made_runs in 0..MAX_RUNS {
             let state = read_set(dir);
             let can_jump = self.can_jump(plan.stream_id);
             let needed = missing(&state, expected);
@@ -3779,6 +4316,16 @@ impl TrickplayPasses {
             if !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
                 return SlotEnd::Cancelled;
             }
+            // Switched off, or its addon's previews turned off, since the last
+            // run. The first run follows the check at slot entry.
+            if made_runs > 0
+                && let Some(end) = self
+                    .refused_now(plan)
+                    .await
+            {
+                drop_stand_in(plan, dir, &on_trial);
+                return refused_after_open(end);
+            }
             let (result, stopped) = self
                 .one_run(plan, runner, cancel, pid.clone(), watch, dir, run, follows)
                 .await;
@@ -3786,6 +4333,12 @@ impl TrickplayPasses {
             let moved = self.after_run(plan, dir, run, &result, end);
             if stopped == Some(Stopped::Cancelled) {
                 return SlotEnd::Cancelled;
+            }
+            // A source that stopped sending without closing: it is not read
+            // again for its failure wait, and the slot is free for others.
+            if stopped == Some(Stopped::Stalled) {
+                self.mark_plan_failed(plan);
+                return SlotEnd::Failed;
             }
             // Another version longer than its stored length: its pictures are
             // in a folder of its own, which nobody plays, and the set is made
@@ -3810,13 +4363,33 @@ impl TrickplayPasses {
                             .saturating_add(made),
                 );
             }
+            // Refused while it read: a stand-in is never read on to check its
+            // length, so what it made in this slot goes.
+            if let Some(Stopped::Refused(end)) = stopped {
+                drop_stand_in(plan, dir, &on_trial);
+                return refused_after_open(end);
+            }
             match (end, stopped) {
                 (RunEnd::Failed, _) => {
                     if result.exit_ok && !source_failed(&result) {
                         drop_on_trial(plan, dir, &on_trial);
+                        // Its rough pictures too, which `drop_on_trial`
+                        // leaves, and does not reach with no sheet made.
+                        if plan
+                            .other_version
+                            .is_some()
+                        {
+                            drop_rough(dir);
+                        }
                     }
                     return SlotEnd::Failed;
                 }
+                // It read to the end of the file and passed the key check
+                // (see `after_run`): its sheets are kept, but its last one
+                // went and the end is not marked, so the next play reads the
+                // end of this version again. No other source is opened for
+                // one sheet.
+                (RunEnd::Unclean, _) => return SlotEnd::Over,
                 (_, Some(Stopped::StoodDown)) => return SlotEnd::StoodDown,
                 (_, Some(Stopped::Moved(to))) => {
                     viewer = to;
@@ -3842,6 +4415,12 @@ impl TrickplayPasses {
                         }
                         self.mark_plan_failed(plan);
                         drop_on_trial(plan, dir, &on_trial);
+                        if plan
+                            .other_version
+                            .is_some()
+                        {
+                            drop_rough(dir);
+                        }
                         info!(
                             set_id = %plan.set_id,
                             stream_id = %plan.stream_id,
@@ -3886,10 +4465,12 @@ impl TrickplayPasses {
         SlotEnd::Over
     }
 
-    /// One run of a pass. Every `watch_check` it asks whether to give way
-    /// (see [`Self::gives_way`]), then whether to follow the viewer to a part
-    /// with no pictures (see [`follows_to`]); either stops the run, which
-    /// then ends as cancelled.
+    /// One run of a pass. Every `watch_check` it asks whether the stream may
+    /// still be read (see [`Self::refusal`]), then whether it has made no new
+    /// sheet for [`STALL_WAIT`] (a stalled source), then whether to give way (see
+    /// [`Self::gives_way`]), then whether to follow the viewer to a part with
+    /// no pictures (see [`follows_to`]); any of them stops the run, which then
+    /// ends as cancelled.
     #[allow(clippy::too_many_arguments)]
     async fn one_run<R, W>(
         &self,
@@ -3912,6 +4493,8 @@ impl TrickplayPasses {
         let expected = expected_sheets(plan.pictures);
         let can_jump = self.can_jump(plan.stream_id);
         let made = Arc::new(AtomicU32::new(0));
+        let first_sheet_within = (run.start > 0)
+            .then(|| first_sheet_wait(plan.size, expected, limits.seek_wait));
         let job = PassJob {
             input: plan
                 .input
@@ -3921,10 +4504,16 @@ impl TrickplayPasses {
             min_free_bytes: limits.min_free_bytes,
             start_sheet: run.start,
             stop_after: run.stop_after,
-            first_sheet_within: (run.start > 0)
-                .then(|| first_sheet_wait(plan.size, expected, limits.seek_wait)),
+            first_sheet_within,
             made: made.clone(),
         };
+        // A run that starts part way has its first sheet's own wait, which
+        // may be longer for a large file.
+        let stall_after = limits
+            .stall_wait
+            .max(first_sheet_within.unwrap_or_default());
+        let mut last_made = 0;
+        let mut made_at = Instant::now();
         let began = Instant::now();
         let (stop_tx, stop_rx) = oneshot::channel();
         let mut stop = Some(stop_tx);
@@ -3941,7 +4530,27 @@ impl TrickplayPasses {
                     }
                 }
                 _ = tokio::time::sleep(limits.watch_check), if stop.is_some() => {
-                    let why = if let Some(heard) = self.gives_way(plan.set_id, watch) {
+                    let made_now = made.load(Ordering::SeqCst);
+                    if made_now != last_made {
+                        last_made = made_now;
+                        made_at = Instant::now();
+                    }
+                    // Switched off, or its addon's previews turned off, while
+                    // it reads: the read stops within one check.
+                    let why = if let Some(end) = self.refused_now(plan).await {
+                        Some(Stopped::Refused(end))
+                    } else if made_at.elapsed() >= stall_after {
+                        warn!(
+                            set_id = %plan.set_id,
+                            stream_id = %plan.stream_id,
+                            start = run.start,
+                            sheets = made_now,
+                            "trick play pass stalled: no new picture from the source for {} minutes; \
+                             not retrying for a while",
+                            stall_after.as_secs() / 60
+                        );
+                        Some(Stopped::Stalled)
+                    } else if let Some(heard) = self.gives_way(plan.set_id, watch) {
                         info!(
                             set_id = %plan.set_id,
                             stream_id = %plan.stream_id,
@@ -4017,6 +4626,28 @@ impl TrickplayPasses {
             .then(|| u64::from(run.start) + result.made_sheets - 1);
         let last_made_n = last_made.and_then(|n| u32::try_from(n).ok());
         let mut moved_set = false;
+        // The key check, for every run that read to the end of the file: one
+        // that wrote a line the tables do not know read the file's length
+        // all the same.
+        if matches!(end, RunEnd::End | RunEnd::Unclean)
+            && let Some(highest) = last_made
+        {
+            let moved = moved_if_longer(plan, dir.as_path(), highest);
+            if moved != *dir {
+                // The set's folder is gone: its plays follow their own pick,
+                // which finds this stream's folder.
+                self.lock()
+                    .selection
+                    .retain(|_, s| *s != plan.set_id);
+                // Sheets below this run's start may be another version's:
+                // this pass makes them again from this file.
+                for n in 0..run.start {
+                    remove_sheet(&moved, n);
+                }
+                *dir = moved;
+                moved_set = true;
+            }
+        }
         match end {
             RunEnd::Goal => debug!(
                 set_id = %plan.set_id,
@@ -4025,23 +4656,6 @@ impl TrickplayPasses {
                 "trick play run made the sheets it was after"
             ),
             RunEnd::End => {
-                if let Some(highest) = last_made {
-                    let moved = moved_if_longer(plan, dir.as_path(), highest);
-                    if moved != *dir {
-                        // The set's folder is gone: its plays follow their
-                        // own pick, which finds this stream's folder.
-                        self.lock()
-                            .selection
-                            .retain(|_, s| *s != plan.set_id);
-                        // Sheets below this run's start may be another
-                        // version's: this pass makes them again from this file.
-                        for n in 0..run.start {
-                            remove_sheet(&moved, n);
-                        }
-                        *dir = moved;
-                        moved_set = true;
-                    }
-                }
                 if let Err(e) = std::fs::write(dir.join(END_MARKER), b"") {
                     warn!(error = %e, "could not mark the end of trick play pictures");
                 }
@@ -4086,6 +4700,24 @@ impl TrickplayPasses {
                 exit_code = ?result.exit_code,
                 "trick play: the file ends before that place"
             ),
+            RunEnd::Unclean => {
+                // No `end` marker: the last sheet may be partly filled, so it
+                // goes, and a later run reads the end of the file again. Not
+                // a failure: the next play reads the end of this version, not
+                // another version.
+                if let Some(n) = last_made_n {
+                    remove_sheet(dir, n);
+                }
+                warn!(
+                    set_id = %plan.set_id,
+                    stream_id = %plan.stream_id,
+                    start = run.start,
+                    sheets = result.made_sheets,
+                    stderr = %crate::playback::probe::redact_urls_in(&result.stderr),
+                    "trick play run reached the end of the file with a message it does not know; \
+                     not marking the end"
+                );
+            }
             RunEnd::Failed => {
                 // The last sheet this run wrote may be a partly filled one
                 // flushed at a false end of input.
@@ -4142,6 +4774,8 @@ impl TrickplayPasses {
     /// Server shutdown: cancels every pass with no grace period and waits for
     /// each process to exit, killing it if it does not. Exiting runs no
     /// destructors, so this is what keeps ffmpeg from outliving the server.
+    /// The kill after `KILL_WAIT` works on Linux and macOS only (see
+    /// `kill_pid`); elsewhere a pass that ignores its stop is left running.
     pub async fn kill_all(&self) {
         let passes: Vec<Pass> = {
             let mut st = self.lock();
@@ -4184,6 +4818,27 @@ impl TrickplayPasses {
             }
         }
     }
+}
+
+/// How a slot ends when its stream is refused (see
+/// [`TrickplayPasses::refusal`]) after its source was opened: a stream not to
+/// be read any more ends as `Failed`, so it counts towards [`MAX_SOURCES`]
+/// like any source opened. A switch turned off ends it as before.
+fn refused_after_open(end: SlotEnd) -> SlotEnd {
+    match end {
+        SlotEnd::Skipped => SlotEnd::Failed,
+        end => end,
+    }
+}
+
+/// Whether the key check moved the version `plan` reads to a folder of its
+/// own (see [`moved_if_longer`]): that folder exists only after a move, or
+/// [`set_for`] would have chosen it.
+fn moved_away(plan: &PassPlan) -> bool {
+    plan.other_version
+        .is_none()
+        && plan.set_id != plan.stream_id
+        && set_dir(&plan.root, plan.stream_id).is_dir()
 }
 
 /// The key check: a run that read to the end of the file and wrote a sheet,
@@ -4285,6 +4940,8 @@ mod tests {
             quiet_waiting: Duration::from_millis(100),
             quiet_alone: Duration::from_secs(10),
             seek_wait: Duration::from_secs(1),
+            no_jump_wait: NO_JUMP_WAIT,
+            stall_wait: Duration::from_secs(60),
             follow_every: Duration::from_millis(30),
             max_follows: MAX_FOLLOWS,
             rough_budget: Duration::from_secs(5),
@@ -4307,8 +4964,8 @@ mod tests {
             root: root.to_path_buf(),
             pictures: RUNTIME / INTERVAL_SECS,
             size: None,
-            cap_bytes: u64::MAX,
-            keep_for: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+            estimate: 0,
+            played: StreamInfo::default(),
             rough: false,
             db: None,
             others: Vec::new(),
@@ -4452,8 +5109,9 @@ mod tests {
     /// ending when `wait_for_cancel`, it waits to be cancelled. With
     /// `no_jump`, a run that starts part way makes no first sheet in time.
     /// With `empty_exit`, a run that ends by itself having made no sheet
-    /// exits with that status and writes that to stderr, as ffmpeg 7 does
-    /// (see [`PAST_END`]); without it, exit 0 as ffmpeg 6 does. Each sheet
+    /// exits with that status and writes that to stderr, as the ffmpeg in
+    /// this server's image does (see [`PAST_END`]); without it, exit 0, as an
+    /// ffmpeg that ends such a run cleanly would. Each sheet
     /// takes `pace`.
     ///
     /// A rough picture takes `grab_pace` and is written as [`JPEG`], or as a
@@ -4802,9 +5460,10 @@ mod tests {
         }
     }
 
-    /// What this server's ffmpeg 7 wrote at `-loglevel error` for a run with
-    /// the pass's arguments started past the end of a file, exit 234 and no
-    /// file written (the end-to-end pre-check, from the file itself).
+    /// What the ffmpeg in this server's image wrote at `-loglevel error` for
+    /// a run with the pass's arguments started past the end of a file, exit
+    /// 234 and no file written (the end-to-end pre-check, from the file
+    /// itself).
     const PAST_END: &str = "\
         [mjpeg @ 0x8] Non full-range YUV is non-standard, set strict_std_compliance to at \
         most unofficial to use it.\n\
@@ -4827,7 +5486,7 @@ mod tests {
         [in#0/matroska,webm @ 0x7] File ended prematurely at pos. 70027876 (0x42c8a64)\n";
 
     /// A source that dropped after the seek and did not come back, before the
-    /// lines of [`PAST_END`]: ffmpeg 7 then ends its input as at the end of
+    /// lines of [`PAST_END`]: ffmpeg then ends its input as at the end of
     /// the file, so the status is the same.
     const SOURCE_DROPPED: &str = "\
         [http @ 0x6] Stream ends prematurely at 52428800, should be 70027876\n\
@@ -6141,6 +6800,505 @@ mod tests {
         );
     }
 
+    /// A test server's context whose data directory is `dir`, so nothing a
+    /// test writes or deletes touches a real data directory.
+    async fn ctx_in(dir: &Path) -> crate::integration_test::TestGuard {
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                data_dir: dir.to_path_buf(),
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                disable_startup_tasks: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        guard
+    }
+
+    /// A database holding only settings: the switch and the cache size.
+    async fn settings_db(on: bool, cache_mb: i64) -> sqlx::SqlitePool {
+        let pool = db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        db::migrate(&pool)
+            .await
+            .unwrap();
+        save_settings(&pool, on, cache_mb).await;
+        pool
+    }
+
+    async fn save_settings(pool: &sqlx::SqlitePool, on: bool, cache_mb: i64) {
+        let cfg = api::ServerConfiguration {
+            trickplay_while_streaming: Some(on),
+            trickplay_cache_size_mb: Some(cache_mb),
+            ..Default::default()
+        };
+        db::Settings::set_config(pool, &cfg)
+            .await
+            .unwrap();
+    }
+
+    /// A pass over a 7,200 s stream with a set of its own, whose version
+    /// played is listed by `addon`.
+    fn addon_plan(root: &Path, stream_id: Uuid, addon: &Addon) -> PassPlan {
+        PassPlan {
+            played: StreamInfo {
+                descriptor: StreamDescriptor::http(URL),
+                addon_id: Some(addon.id),
+                ..Default::default()
+            },
+            ..plan(root, stream_id)
+        }
+    }
+
+    #[test]
+    fn only_movies_episodes_and_streams_have_pictures() {
+        for kind in [
+            db::MediaKind::Movie,
+            db::MediaKind::Episode,
+            db::MediaKind::Stream,
+            db::MediaKind::StreamGroup,
+        ] {
+            assert!(kind_has_pictures(&kind), "{kind:?}");
+        }
+        for kind in [
+            db::MediaKind::Track,
+            db::MediaKind::Album,
+            db::MediaKind::Artist,
+            db::MediaKind::Series,
+            db::MediaKind::TvChannel,
+        ] {
+            assert!(!kind_has_pictures(&kind), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_music_track_gets_no_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = ctx_in(tmp.path()).await;
+        let ctx = &guard.0;
+        let mut track = db::Media {
+            title: "Invented Song".to_string(),
+            kind: db::MediaKind::Track,
+            // A track is refused without a music provider id.
+            external_ids: db::ExternalIds {
+                deezer_track: Some(1),
+                ..Default::default()
+            },
+            runtime: Some(600),
+            ..Default::default()
+        };
+        track
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let play = PlayStart {
+            play_session_id: "play-a".to_string(),
+            item_id: track.id,
+            media_source_id: None,
+            device_id: "device-a".to_string(),
+            user_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            resolve_plan(ctx, &play)
+                .await
+                .err(),
+            Some(Ineligible::NotVideo)
+        );
+    }
+
+    #[test]
+    fn a_failed_addon_read_refuses_the_pass() {
+        assert_eq!(
+            addon_from_read(Err(anyhow::anyhow!("pool timed out"))).err(),
+            Some(Ineligible::AddonReadFailed)
+        );
+        assert!(
+            matches!(addon_from_read(Ok(None)), Ok(None)),
+            "a deleted addon: the stream is judged by its row alone"
+        );
+        let found = addon("stremio", false);
+        let id = found.id;
+        assert_eq!(
+            addon_from_read(Ok(Some(found)))
+                .ok()
+                .flatten()
+                .map(|a| a.id),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn one_addons_rule_is_set_and_dropped_without_a_read() {
+        let passes = TrickplayPasses::with_limits(fast());
+        let kept = addon("stremio", false);
+        let mut changed = addon("stremio", false);
+        passes.set_addon_rules(std::slice::from_ref(&kept));
+        let handed_out = passes.addon_rules();
+
+        changed.trickplay = false;
+        passes.set_addon_rule(&changed);
+        let rules = passes.addon_rules();
+        assert_eq!(rules.get(&changed.id), Some(&AddonRule::new(&changed)));
+        assert!(rules.contains_key(&kept.id), "the other rules stay");
+        assert!(
+            !handed_out.contains_key(&changed.id),
+            "a snapshot already handed out does not change"
+        );
+
+        changed.trickplay = true;
+        passes.set_addon_rule(&changed);
+        assert!(
+            passes
+                .addon_rules()
+                .get(&changed.id)
+                .is_some_and(|rule| rule.trickplay)
+        );
+
+        passes.drop_addon_rule(changed.id);
+        let rules = passes.addon_rules();
+        assert!(!rules.contains_key(&changed.id));
+        assert!(rules.contains_key(&kept.id));
+    }
+
+    #[test]
+    fn cap_bytes_saturates() {
+        let huge = api::ServerConfiguration {
+            trickplay_cache_size_mb: Some(i64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(cap_bytes(&huge), u64::MAX);
+    }
+
+    #[test]
+    fn pass_args_keep_a_percent_in_the_folder_plain() {
+        let args = pass_args(URL, Path::new("/srv/100%/trickplay/abc"), 0);
+        let output = args
+            .iter()
+            .find(|a| a.ends_with(".jpg"))
+            .unwrap();
+        let expected = Path::new("/srv/100%%/trickplay/abc")
+            .join("%d.jpg")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(output, &expected);
+    }
+
+    #[test]
+    fn a_pass_and_the_field_judge_a_length_alike() {
+        let (mut media, info) = row(StreamDescriptor::http(URL));
+        let probed = |ticks: i64| {
+            Some(api::MediaSourceInfo {
+                run_time_ticks: Some(ticks),
+                ..Default::default()
+            })
+        };
+        // 14,400.5 s: four hours and half a second.
+        let ticks = 144_005_000_000;
+        media.probe_data = probed(ticks);
+        let runtime = runtime_s(&media, None);
+        assert_eq!(runtime, Some(14_400));
+        assert_eq!(eligible_row(&media, &info, runtime), Ok(()));
+        assert!(manifest_entry(Some(ticks)).is_some());
+
+        // 14,401 s.
+        let ticks = 144_010_000_000;
+        media.probe_data = probed(ticks);
+        assert_eq!(
+            eligible_row(&media, &info, runtime_s(&media, None)),
+            Err(Ineligible::TooLong)
+        );
+        assert!(manifest_entry(Some(ticks)).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_addon_switched_off_while_a_pass_waits_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let mut source = addon("stremio", false);
+        passes.set_addon_rules(std::slice::from_ref(&source));
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let held = passes
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        let stream_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin(
+                "play-a",
+                addon_plan(tmp.path(), stream_id, &source),
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        source.trickplay = false;
+        passes.set_addon_rule(&source);
+        drop(held);
+        until(|| !passes.is_queued(stream_id)).await;
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            0,
+            "the source is never opened"
+        );
+        assert!(
+            !passes.failed_recently(stream_id, Instant::now()),
+            "not a failure: the next play is judged afresh"
+        );
+
+        // A stream with no addon is judged by its row alone, and is read.
+        let loose = Uuid::new_v4();
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        passes
+            .begin("play-b", plan(tmp.path(), loose), runner.clone(), always())
+            .await;
+        until(|| !passes.is_queued(loose)).await;
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            set_dir(tmp.path(), loose)
+                .join(DONE_MARKER)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_addon_switched_off_during_a_run_stops_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let mut source = addon("stremio", false);
+        passes.set_addon_rules(std::slice::from_ref(&source));
+        let runner = Arc::new(FakeRunner {
+            wait_for_cancel: true,
+            ..Default::default()
+        });
+        let stream_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin(
+                "play-a",
+                addon_plan(tmp.path(), stream_id, &source),
+                runner.clone(),
+                always(),
+            )
+            .await;
+        until(|| {
+            runner
+                .runs
+                .load(Ordering::SeqCst)
+                == 1
+        })
+        .await;
+        source.trickplay = false;
+        passes.set_addon_rule(&source);
+        until_named("the run stopped", || {
+            runner
+                .killed
+                .load(Ordering::SeqCst)
+        })
+        .await;
+        until(|| !passes.is_queued(stream_id)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            1,
+            "no run after it"
+        );
+        assert!(!passes.failed_recently(stream_id, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn switching_off_stops_a_running_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = settings_db(true, 1024).await;
+        let passes = TrickplayPasses::with_limits(fast());
+        let runner = Arc::new(FakeRunner {
+            wait_for_cancel: true,
+            ..Default::default()
+        });
+        let stream_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin(
+                "play-a",
+                PassPlan {
+                    db: Some(pool.clone()),
+                    ..plan(tmp.path(), stream_id)
+                },
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        until(|| {
+            runner
+                .runs
+                .load(Ordering::SeqCst)
+                == 1
+        })
+        .await;
+        save_settings(&pool, false, 1024).await;
+        until_named("the run stopped", || {
+            runner
+                .killed
+                .load(Ordering::SeqCst)
+        })
+        .await;
+        until(|| !passes.is_queued(stream_id)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            1,
+            "no run after it"
+        );
+        assert!(!passes.failed_recently(stream_id, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn the_disk_limits_are_read_when_the_pass_takes_the_slot() {
+        for (cache_mb, old_kept) in [(100, false), (2048, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            // The cache size when the play starts: all of it this set's.
+            let pool = settings_db(true, 100).await;
+            let passes = TrickplayPasses::with_limits(fast());
+            let old = set_dir(tmp.path(), Uuid::new_v4());
+            write_sheets(&old, 0..3);
+            let runner = Arc::new(FakeRunner {
+                sheets: 29,
+                ..Default::default()
+            });
+            let held = passes
+                .inner
+                .slots
+                .acquire()
+                .await
+                .unwrap();
+            let stream_id = Uuid::new_v4();
+            passes.register("play-a", Uuid::new_v4(), "device-a");
+            let begun = passes
+                .begin(
+                    "play-a",
+                    PassPlan {
+                        db: Some(pool.clone()),
+                        estimate: 100 * 1024 * 1024,
+                        ..plan(tmp.path(), stream_id)
+                    },
+                    runner.clone(),
+                    always(),
+                )
+                .await;
+            assert_eq!(begun, Begin::Queued);
+            // Saved after the play started, before its pass takes the slot.
+            save_settings(&pool, true, cache_mb).await;
+            drop(held);
+            until(|| !passes.is_queued(stream_id)).await;
+            assert_eq!(old.exists(), old_kept, "cache size {cache_mb} MB");
+            assert!(
+                set_dir(tmp.path(), stream_id)
+                    .join(DONE_MARKER)
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn the_start_up_prune_switched_off_deletes_only_its_own_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .join(ROOT_DIR);
+        let set = set_dir(&root, Uuid::new_v4());
+        write_sheets(&set, 0..2);
+        let foreign_dir = root.join("notes");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign_file = root.join("readme.txt");
+        std::fs::write(&foreign_file, b"not a set").unwrap();
+        let id_file = root.join(
+            Uuid::new_v4()
+                .as_simple()
+                .to_string(),
+        );
+        std::fs::write(&id_file, b"not a folder").unwrap();
+
+        prune_on_start(&root, false, u64::MAX, None, SystemTime::now());
+        assert!(!set.exists());
+        assert!(foreign_dir.exists());
+        assert!(foreign_file.exists());
+        assert!(id_file.exists());
+
+        // With nothing else in it, the folder itself goes too.
+        std::fs::remove_dir(&foreign_dir).unwrap();
+        std::fs::remove_file(&foreign_file).unwrap();
+        std::fs::remove_file(&id_file).unwrap();
+        write_sheets(&set, 0..2);
+        prune_on_start(&root, false, u64::MAX, None, SystemTime::now());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn the_start_up_prune_follows_the_settings_handed_in_and_holds_the_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = ctx_in(tmp.path()).await;
+        let ctx = &guard.0;
+        let root = root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        let set = set_dir(&root, Uuid::new_v4());
+        write_sheets(&set, 0..2);
+        let switch = |on: bool| api::ServerConfiguration {
+            trickplay_while_streaming: Some(on),
+            ..Default::default()
+        };
+
+        // The stored settings say off; the ones handed in say on.
+        prune_at_startup(ctx, &switch(true)).await;
+        assert!(set.exists(), "switched on: a fresh set stays");
+
+        // While a pass holds the slot, it waits and deletes nothing.
+        let held = ctx
+            .sessions
+            .trickplay
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        let pruning = tokio::spawn({
+            let ctx = ctx.clone();
+            let off = switch(false);
+            async move {
+                prune_at_startup(&ctx, &off).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(set.exists(), "it waits for the slot");
+        drop(held);
+        pruning
+            .await
+            .unwrap();
+        assert!(!set.exists(), "switched off: the set goes");
+    }
+
     #[tokio::test]
     async fn versions_of_one_set_share_one_pass() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6574,7 +7732,7 @@ mod tests {
         };
         let past_end = exited(234, PAST_END.to_string());
         let past_end_http = exited(234, format!("{PAST_END_HTTP}{PAST_END}"));
-        // 940 pictures: sheets 0 to 37. ffmpeg 7 started past the end: 234
+        // 940 pictures: sheets 0 to 37. ffmpeg started past the end: 234
         // (AVERROR(EINVAL) on Unix), -22 on Windows, no sheet.
         assert_eq!(run_end(&past_end, run(36), 940), RunEnd::Nothing);
         assert_eq!(run_end(&past_end_http, run(36), 940), RunEnd::Nothing);
@@ -7086,7 +8244,7 @@ mod tests {
         let dir = set_dir(tmp.path(), set_id);
         write_sheets(&dir, 0..11);
         // 940 pictures fill sheets 0 to 37; this file ends with sheet 36.
-        // The run from sheet 37 ends as ffmpeg 7 does there: 234, no sheet.
+        // The run from sheet 37 ends as ffmpeg does there: 234, no sheet.
         let runner = Arc::new(FakeRunner {
             sheets: 37,
             empty_exit: Some((234, PAST_END)),
@@ -7171,7 +8329,7 @@ mod tests {
         let dir = set_dir(tmp.path(), set_id);
         write_sheets(&dir, 0..36);
         // 940 pictures fill sheets 0 to 37; this file ends with sheet 35, so
-        // a run from 36 finds it over: 234 and no sheet, from ffmpeg 7.
+        // a run from 36 finds it over: 234 and no sheet, as from ffmpeg.
         let runner = Arc::new(FakeRunner {
             sheets: 36,
             empty_exit: Some((234, PAST_END)),
@@ -9240,5 +10398,801 @@ mod tests {
         let dir = set_dir(tmp.path(), set_id);
         assert!(is_done(&dir));
         assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+    }
+
+    /// A line no table knows, as an ffmpeg might word a source it gave up on.
+    const UNKNOWN_LINE: &str =
+        "[tls @ 0x9] The specified session has been invalidated for some reason.\n";
+
+    #[test]
+    fn a_line_it_does_not_know_at_the_end_of_the_file_marks_no_end() {
+        let run = |start: u32| Run {
+            start,
+            stop_after: None,
+        };
+        let ended = |made: u64, stderr: &str| RunResult {
+            exit_ok: true,
+            exit_code: Some(0),
+            made_sheets: made,
+            stderr: stderr.to_string(),
+            ..Default::default()
+        };
+        // 940 pictures: sheets 0 to 37.
+        assert_eq!(
+            run_end(&ended(38, UNKNOWN_LINE), run(0), 940),
+            RunEnd::Unclean
+        );
+        assert_eq!(
+            run_end(&ended(18, UNKNOWN_LINE), run(19), 940),
+            RunEnd::Unclean
+        );
+        assert_eq!(
+            run_end(&ended(0, UNKNOWN_LINE), run(37), 940),
+            RunEnd::Unclean
+        );
+        // Lines the tables know still end it, as does no line at all.
+        assert_eq!(
+            run_end(&ended(18, PAST_END_HTTP), run(19), 940),
+            RunEnd::End
+        );
+        assert_eq!(run_end(&ended(38, ""), run(0), 940), RunEnd::End);
+        // With the status of a run that found no picture, its own lines are
+        // expected.
+        let past_end = RunResult {
+            exit_code: Some(234),
+            stderr: PAST_END.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(run_end(&past_end, run(37), 940), RunEnd::End);
+        // Short of the end it is a failure, as before.
+        assert_eq!(
+            run_end(&ended(10, UNKNOWN_LINE), run(0), 940),
+            RunEnd::Failed
+        );
+    }
+
+    #[test]
+    fn an_unclean_end_drops_the_last_sheet_and_writes_no_end_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let stream_id = Uuid::new_v4();
+        let plan = plan(tmp.path(), stream_id);
+        let mut dir = set_dir(tmp.path(), stream_id);
+        // 720 pictures: sheets 0 to 28, all made by one run.
+        write_sheets(&dir, 0..29);
+        let run = Run {
+            start: 0,
+            stop_after: None,
+        };
+        let result = RunResult {
+            exit_ok: true,
+            exit_code: Some(0),
+            made_sheets: 29,
+            stderr: UNKNOWN_LINE.to_string(),
+            ..Default::default()
+        };
+        let end = run_end(&result, run, plan.pictures);
+        assert_eq!(end, RunEnd::Unclean);
+        assert!(!passes.after_run(&plan, &mut dir, run, &result, end));
+        assert!(
+            !dir.join(END_MARKER)
+                .exists()
+        );
+        assert_eq!(sheets_in(&dir), (0..28).collect::<Vec<u32>>());
+        assert!(
+            !passes.failed_recently(stream_id, Instant::now()),
+            "not a failure: the next play reads the end of this version again"
+        );
+
+        // A file longer than its stored length, in a set keyed by its count:
+        // the key check still moves its pictures to a folder of its own.
+        let stream_id = Uuid::new_v4();
+        let set_id = Uuid::new_v4();
+        let plan = set_plan(tmp.path(), stream_id, set_id);
+        let shared = set_dir(tmp.path(), set_id);
+        let mut dir = shared.clone();
+        // Sheet 29 is past the count's last, 28.
+        write_sheets(&dir, 0..30);
+        let result = RunResult {
+            made_sheets: 30,
+            ..result
+        };
+        let end = run_end(&result, run, plan.pictures);
+        assert_eq!(end, RunEnd::Unclean);
+        assert!(passes.after_run(&plan, &mut dir, run, &result, end));
+        assert_eq!(dir, set_dir(tmp.path(), stream_id));
+        assert!(!shared.exists(), "nothing of it is left in the shared set");
+        assert!(
+            !dir.join(END_MARKER)
+                .exists()
+        );
+        assert_eq!(sheets_in(&dir), (0..29).collect::<Vec<u32>>());
+    }
+
+    #[tokio::test]
+    async fn an_early_source_error_survives_a_flood_and_the_kept_text_is_bounded() {
+        let mut text =
+            String::from("[http @ 0x6] Server returned 503 Service Unavailable\n");
+        for n in 0..20_000 {
+            text.push_str(&format!(
+                "[h264 @ 0x9] error while decoding MB {n} 0, bytestream -5\n"
+            ));
+        }
+        text.push_str("[in#0 @ 0x7] the last line\n");
+        let kept = read_stderr(text.as_bytes()).await;
+        assert!(
+            kept.len() <= STDERR_TAIL_BYTES + 4 * STDERR_LINE_BYTES,
+            "{}",
+            kept.len()
+        );
+        assert!(
+            kept.contains("the last line"),
+            "the tail is kept for the log"
+        );
+        let result = RunResult {
+            exit_ok: true,
+            stderr: kept,
+            ..Default::default()
+        };
+        assert!(source_failed(&result), "the early line is kept");
+        assert!(unknown_line(&result), "and one line no table knows");
+
+        // A line that never ends keeps only its start.
+        let endless = "x".repeat(1_000_000);
+        let kept = read_stderr(endless.as_bytes()).await;
+        assert!(kept.len() <= STDERR_LINE_BYTES + 1, "{}", kept.len());
+
+        // Lines end at a carriage return too, and the repeats of a known
+        // line fill only the tail.
+        let repeated =
+            "[http @ 0x6] Stream ends prematurely at 1, should be 2\r".repeat(5_000);
+        let kept = read_stderr(repeated.as_bytes()).await;
+        assert!(
+            kept.len() <= STDERR_TAIL_BYTES + STDERR_LINE_BYTES + 1,
+            "{}",
+            kept.len()
+        );
+        assert!(
+            kept.lines()
+                .all(|line| line.ends_with("should be 2"))
+        );
+    }
+
+    /// A run's job for [`read_progress`], writing nowhere.
+    fn progress_job(dir: &Path) -> PassJob {
+        PassJob {
+            input: URL.to_string(),
+            out_dir: dir.to_path_buf(),
+            pid: Arc::new(AtomicU32::new(0)),
+            min_free_bytes: 0,
+            start_sheet: 0,
+            stop_after: None,
+            first_sheet_within: None,
+            made: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_comes_with_the_last_progress_block_counts_its_sheet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let job = progress_job(tmp.path());
+        // The stop is already there when ffmpeg's last block is read: the
+        // lines written before it are read first.
+        let (stop, mut cancel) = oneshot::channel();
+        stop.send(())
+            .unwrap();
+        let block: &[u8] = b"frame=3\nprogress=continue\nframe=4\nprogress=end\n";
+        let seen = read_progress(block, &job, &mut cancel).await;
+        assert_eq!(
+            seen,
+            RunProgress {
+                made_sheets: 4,
+                ended: true,
+                ..Default::default()
+            }
+        );
+        assert!(
+            !seen.ended_before_stop(),
+            "it ended by itself, before the stop"
+        );
+
+        // The last block read and the pipe still open: the stop is seen after
+        // it, and the run is known to have ended its output.
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"frame=4\nprogress=end\n")
+            .await
+            .unwrap();
+        let (stop, mut cancel) = oneshot::channel();
+        stop.send(())
+            .unwrap();
+        let seen =
+            read_progress(tokio::io::BufReader::new(reader), &job, &mut cancel).await;
+        assert_eq!(
+            seen,
+            RunProgress {
+                made_sheets: 4,
+                cancelled: true,
+                ended: true,
+                ..Default::default()
+            }
+        );
+        drop(writer);
+        // So the run's last sheet, which may be partly filled, goes (see
+        // `after_run`'s `Cancelled` arm and its test).
+        assert!(seen.ended_before_stop());
+        // A stop before the last block keeps every sheet.
+        assert!(
+            !RunProgress {
+                made_sheets: 4,
+                cancelled: true,
+                ..Default::default()
+            }
+            .ended_before_stop()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_stalls_frees_the_slot_and_counts_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(Limits {
+            stall_wait: Duration::from_millis(100),
+            ..fast()
+        });
+        // Makes sheets 0 to 4, then the source stops sending without closing.
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            stall_at: Some(5),
+            ..Default::default()
+        });
+        let stream_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin(
+                "play-a",
+                plan(tmp.path(), stream_id),
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        until_named("the stalled run stopped", || {
+            runner
+                .killed
+                .load(Ordering::SeqCst)
+        })
+        .await;
+        until(|| !passes.is_queued(stream_id)).await;
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            1,
+            "no run after it"
+        );
+        assert!(passes.failed_recently(stream_id, Instant::now()));
+        let dir = set_dir(tmp.path(), stream_id);
+        assert_eq!(
+            sheets_in(&dir),
+            (0..5).collect::<Vec<u32>>(),
+            "the sheets made are kept"
+        );
+        assert!(!is_done(&dir));
+        assert!(
+            passes
+                .inner
+                .slots
+                .try_acquire()
+                .is_ok(),
+            "the slot is free"
+        );
+    }
+
+    #[test]
+    fn a_slow_moment_marks_a_source_only_for_a_while() {
+        let passes = TrickplayPasses::with_limits(Limits {
+            no_jump_wait: Duration::from_millis(50),
+            ..fast()
+        });
+        let stream_id = Uuid::new_v4();
+        passes.mark_no_jump(stream_id);
+        passes.mark_no_rough(stream_id);
+        assert!(!passes.can_jump(stream_id));
+        assert!(!passes.can_rough(stream_id));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(passes.can_jump(stream_id), "a run may start part way again");
+        assert!(passes.can_rough(stream_id));
+
+        // With the production wait, the mark holds for now.
+        let passes = TrickplayPasses::new();
+        passes.mark_no_jump(stream_id);
+        assert!(!passes.can_jump(stream_id));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_stand_ins_rough_pictures_go_with_its_sheets() {
+        // The version played failed lately, so other-a is read first and gets
+        // the rough stage; its file is shorter, so it is rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            short: strings(&["other-a"]),
+            ..Default::default()
+        });
+        let plan = PassPlan {
+            pictures: 940,
+            rough: true,
+            ..plan_with(
+                tmp.path(),
+                set_id,
+                &[other_source("other-a"), other_source("other-b")],
+            )
+        };
+        passes.mark_failed(plan.stream_id, Instant::now() + FAILURE_WAIT);
+        play_through(
+            &passes,
+            "play-a",
+            plan,
+            runner.clone(),
+            always(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(runner.grabs(), rough_order(940, ROUGH_PICTURES));
+        assert_eq!(runner.inputs(), strings(&["other-a", "other-b"]));
+        let at_runs = runner
+            .rough_at_runs
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(
+            !at_runs[0].is_empty(),
+            "other-a's run had its rough pictures"
+        );
+        assert!(
+            at_runs[1].is_empty(),
+            "they went before other-b's run: {:?}",
+            at_runs[1]
+        );
+        let dir = set_dir(tmp.path(), set_id);
+        assert!(is_done(&dir));
+        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
+    }
+
+    /// Two versions of one 7,200 s title, each read from its own input, into
+    /// one set: version-a's play starts the pass and version-b's joins it
+    /// while it waits for the slot. Gives version-b's stream id.
+    async fn join_two_versions(
+        passes: &TrickplayPasses,
+        root: &Path,
+        set_id: Uuid,
+        runner: &Arc<FakeRunner>,
+        joined: PassPlan,
+    ) -> Uuid {
+        let held = passes
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let first = passes
+            .begin(
+                "play-a",
+                PassPlan {
+                    input: "version-a".to_string(),
+                    pictures: joined.pictures,
+                    ..set_plan(root, Uuid::new_v4(), set_id)
+                },
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(first, Begin::Queued);
+        let version_b = joined.stream_id;
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        let second = passes
+            .begin("play-b", joined, runner.clone(), always())
+            .await;
+        assert_eq!(second, Begin::Joined);
+        drop(held);
+        until(|| !passes.is_queued(set_id)).await;
+        version_b
+    }
+
+    /// Version-b's plan, read from its own input into `set_id`.
+    fn version_b(root: &Path, set_id: Uuid) -> PassPlan {
+        PassPlan {
+            input: "version-b".to_string(),
+            ..set_plan(root, Uuid::new_v4(), set_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_play_that_joined_has_its_version_read_when_the_first_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["version-a"]),
+            ..Default::default()
+        });
+        let b = join_two_versions(
+            &passes,
+            tmp.path(),
+            set_id,
+            &runner,
+            version_b(tmp.path(), set_id),
+        )
+        .await;
+        assert_eq!(runner.inputs(), strings(&["version-a", "version-b"]));
+        let dir = set_dir(tmp.path(), set_id);
+        assert!(is_done(&dir));
+        assert_eq!(sheets_in(&dir), (0..29).collect::<Vec<u32>>());
+        assert!(!passes.failed_recently(b, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn a_play_that_joined_has_its_version_read_when_the_first_moves_away() {
+        // 940 pictures fill sheets 0 to 37; version-a holds sheet 38 too, so
+        // its pictures move to a folder of its own and the set is left to
+        // make.
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 38,
+            long: strings(&["version-a"]),
+            ..Default::default()
+        });
+        let joined = PassPlan {
+            pictures: 940,
+            ..version_b(tmp.path(), set_id)
+        };
+        join_two_versions(&passes, tmp.path(), set_id, &runner, joined).await;
+        assert_eq!(runner.inputs(), strings(&["version-a", "version-b"]));
+        let dir = set_dir(tmp.path(), set_id);
+        assert!(is_done(&dir));
+        assert_eq!(
+            sheets_in(&dir),
+            (0..38).collect::<Vec<u32>>(),
+            "made from version-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_joined_version_whose_addon_was_switched_off_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let mut source = addon("stremio", false);
+        passes.set_addon_rules(std::slice::from_ref(&source));
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["version-a"]),
+            ..Default::default()
+        });
+        let joined = PassPlan {
+            played: StreamInfo {
+                descriptor: StreamDescriptor::http(URL),
+                addon_id: Some(source.id),
+                ..Default::default()
+            },
+            ..version_b(tmp.path(), set_id)
+        };
+        let held = passes
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let first = passes
+            .begin(
+                "play-a",
+                PassPlan {
+                    input: "version-a".to_string(),
+                    ..set_plan(tmp.path(), Uuid::new_v4(), set_id)
+                },
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(first, Begin::Queued);
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        let second = passes
+            .begin("play-b", joined, runner.clone(), always())
+            .await;
+        assert_eq!(second, Begin::Joined);
+        // Switched off once version-b's play has joined, before the slot is
+        // free.
+        source.trickplay = false;
+        passes.set_addon_rule(&source);
+        drop(held);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner.inputs(),
+            strings(&["version-a"]),
+            "version-b is never opened"
+        );
+        assert!(!is_done(&set_dir(tmp.path(), set_id)));
+    }
+
+    #[tokio::test]
+    async fn a_joined_play_that_ended_has_its_version_left_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["version-a"]),
+            ..Default::default()
+        });
+        let held = passes
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let first = passes
+            .begin(
+                "play-a",
+                PassPlan {
+                    input: "version-a".to_string(),
+                    ..set_plan(tmp.path(), Uuid::new_v4(), set_id)
+                },
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(first, Begin::Queued);
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        let second = passes
+            .begin(
+                "play-b",
+                version_b(tmp.path(), set_id),
+                runner.clone(),
+                always(),
+            )
+            .await;
+        assert_eq!(second, Begin::Joined);
+        // Version-b's play ends before the slot is free.
+        passes.release("play-b");
+        drop(held);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner.inputs(),
+            strings(&["version-a"]),
+            "nobody plays version-b any more"
+        );
+        assert!(!is_done(&set_dir(tmp.path(), set_id)));
+    }
+
+    #[tokio::test]
+    async fn a_stand_in_refused_while_it_reads_leaves_none_of_its_sheets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = settings_db(true, 1024).await;
+        let cfg = api::ServerConfiguration {
+            trickplay_while_streaming: Some(true),
+            trickplay_cache_size_mb: Some(1024),
+            trickplay_other_version: Some(true),
+            ..Default::default()
+        };
+        db::Settings::set_config(&pool, &cfg)
+            .await
+            .unwrap();
+        let passes = TrickplayPasses::with_limits(fast());
+        let mut source = addon("stremio", false);
+        passes.set_addon_rules(std::slice::from_ref(&source));
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            wait_for_cancel: true,
+            ..Default::default()
+        });
+        let set_id = Uuid::new_v4();
+        let mut stand_in = other_source("other-a");
+        stand_in
+            .info
+            .addon_id = Some(source.id);
+        let plan = PassPlan {
+            db: Some(pool.clone()),
+            ..plan_with(tmp.path(), set_id, std::slice::from_ref(&stand_in))
+        };
+        // The version played failed lately, so other-a is read first.
+        passes.mark_failed(plan.stream_id, Instant::now() + FAILURE_WAIT);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin("play-a", plan, runner.clone(), always())
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        let dir = set_dir(tmp.path(), set_id);
+        until_named("other-a made its sheets", || sheets_in(&dir).len() == 29).await;
+        // Its addon's previews are turned off while its run waits at the end.
+        source.trickplay = false;
+        passes.set_addon_rule(&source);
+        until_named("the run stopped", || {
+            runner
+                .killed
+                .load(Ordering::SeqCst)
+        })
+        .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.inputs(), strings(&["other-a"]));
+        assert!(
+            sheets_in(&dir).is_empty(),
+            "its length was never checked: {:?}",
+            sheets_in(&dir)
+        );
+        assert!(
+            !passes.failed_recently(stand_in.stream_id, Instant::now()),
+            "not a failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_keep_time_is_read_when_the_pass_takes_the_slot() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        let settings = |keep_days: i64| api::ServerConfiguration {
+            trickplay_while_streaming: Some(true),
+            trickplay_cache_size_mb: Some(1024),
+            trickplay_keep_days: Some(keep_days),
+            ..Default::default()
+        };
+        for (keep_days, old_kept) in [(1, false), (30, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            // The keep time when the play starts: one day.
+            let pool = settings_db(true, 1024).await;
+            db::Settings::set_config(&pool, &settings(1))
+                .await
+                .unwrap();
+            let passes = TrickplayPasses::with_limits(fast());
+            // A set last shown three days ago.
+            let old = set_dir(tmp.path(), Uuid::new_v4());
+            write_sheets(&old, 0..3);
+            let shown = SystemTime::now() - 3 * day;
+            std::fs::File::open(&old)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(shown))
+                .unwrap();
+            let runner = Arc::new(FakeRunner {
+                sheets: 29,
+                ..Default::default()
+            });
+            let held = passes
+                .inner
+                .slots
+                .acquire()
+                .await
+                .unwrap();
+            let stream_id = Uuid::new_v4();
+            passes.register("play-a", Uuid::new_v4(), "device-a");
+            let begun = passes
+                .begin(
+                    "play-a",
+                    PassPlan {
+                        db: Some(pool.clone()),
+                        ..plan(tmp.path(), stream_id)
+                    },
+                    runner.clone(),
+                    always(),
+                )
+                .await;
+            assert_eq!(begun, Begin::Queued);
+            // Saved after the play started, before its pass takes the slot.
+            db::Settings::set_config(&pool, &settings(keep_days))
+                .await
+                .unwrap();
+            drop(held);
+            until(|| !passes.is_queued(stream_id)).await;
+            assert_eq!(old.exists(), old_kept, "keep time {keep_days} days");
+            assert!(
+                set_dir(tmp.path(), stream_id)
+                    .join(DONE_MARKER)
+                    .exists()
+            );
+        }
+    }
+
+    /// A 300 s clip of 64x64 test pictures, one a second and each a key
+    /// frame, made by the ffmpeg this build runs. False without one.
+    fn make_clip(path: &Path) -> bool {
+        std::process::Command::new(crate::tools::ffmpeg())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=300:size=64x64:rate=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "1",
+                "-y",
+            ])
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// The tables against the ffmpeg this build runs: a whole read ends
+    /// cleanly, with no line the tables do not know, and a run started past
+    /// the end of the file ends empty. Upstream's workflows install no
+    /// ffmpeg, so it is skipped there.
+    #[tokio::test]
+    async fn the_real_ffmpeg_ends_a_clip_as_the_tables_expect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clip = tmp
+            .path()
+            .join("clip.mkv");
+        if !make_clip(&clip) {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        }
+        let input = clip
+            .to_string_lossy()
+            .into_owned();
+        let job = |start_sheet: u32, out_dir: &Path| PassJob {
+            input: input.clone(),
+            out_dir: out_dir.to_path_buf(),
+            pid: Arc::new(AtomicU32::new(0)),
+            min_free_bytes: 0,
+            start_sheet,
+            stop_after: None,
+            first_sheet_within: None,
+            made: Arc::new(AtomicU32::new(0)),
+        };
+        // 300 s: 30 pictures, sheets 0 and 1.
+        let pictures = 30;
+
+        // Read whole. The stop sender is held: a dropped one stops the run.
+        let whole = tmp
+            .path()
+            .join("whole");
+        std::fs::create_dir_all(&whole).unwrap();
+        let (_stop, cancel) = oneshot::channel();
+        let result = run_ffmpeg(job(0, &whole), cancel).await;
+        assert!(result.exit_ok, "{}", result.stderr);
+        assert_eq!(result.made_sheets, 2, "{}", result.stderr);
+        assert!(
+            !unknown_line(&result),
+            "a clean end writes no line the tables do not know: {}",
+            result.stderr
+        );
+        let from_start = Run {
+            start: 0,
+            stop_after: None,
+        };
+        assert_eq!(run_end(&result, from_start, pictures), RunEnd::End);
+        assert!(sheet_whole(&sheet_file(&whole, 0)));
+        assert!(sheet_whole(&sheet_file(&whole, 1)));
+
+        // Started at sheet 2, 500 s in: past the end of the clip.
+        let past = tmp
+            .path()
+            .join("past");
+        std::fs::create_dir_all(&past).unwrap();
+        let (_stop, cancel) = oneshot::channel();
+        let result = run_ffmpeg(job(2, &past), cancel).await;
+        assert!(
+            ended_empty(&result),
+            "exit {:?}: {}",
+            result.exit_code,
+            result.stderr
+        );
+        let past_end = Run {
+            start: 2,
+            stop_after: None,
+        };
+        // With the clip's own count, the end of the file.
+        assert_eq!(run_end(&result, past_end, pictures), RunEnd::End);
+        // With the count of a longer stored length (sheets 0 to 3), the file
+        // ends before that place.
+        assert_eq!(run_end(&result, past_end, 100), RunEnd::Nothing);
     }
 }

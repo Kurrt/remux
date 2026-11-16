@@ -384,7 +384,8 @@ pub async fn init_app(
         );
 
     // Trick play pictures past their age or the disk cap, or all of them when
-    // the switch is off. No pass runs yet. Test servers skip it: their data
+    // the switch is off, by the settings read above. It holds the pass slot,
+    // so no pass runs while it works. Test servers skip it: their data
     // directory may be a real one.
     if !ctx
         .config
@@ -392,8 +393,9 @@ pub async fn init_app(
     {
         tokio::spawn({
             let ctx = ctx.clone();
+            let cfg = saved_config.clone();
             async move {
-                trickplay::prune_at_startup(&ctx).await;
+                trickplay::prune_at_startup(&ctx, &cfg).await;
             }
         });
     }
