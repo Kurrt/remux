@@ -25,6 +25,7 @@ struct StreamingSettingsState {
     trickplay_cache_mb: Signal<i64>,
     trickplay_keep_days: Signal<i64>,
     trickplay_rough_first: Signal<bool>,
+    trickplay_other_version: Signal<bool>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -48,6 +49,7 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
         trickplay_cache_mb: use_signal(|| 1024),
         trickplay_keep_days: use_signal(|| 30),
         trickplay_rough_first: use_signal(|| false),
+        trickplay_other_version: use_signal(|| false),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -144,6 +146,12 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                                 .unwrap_or(false),
                         );
                     load_state
+                        .trickplay_other_version
+                        .set(
+                            cfg.trickplay_other_version
+                                .unwrap_or(false),
+                        );
+                    load_state
                         .config
                         .set(Some(cfg));
                 }
@@ -230,6 +238,11 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
             trickplay_rough_first: Some(
                 *state
                     .trickplay_rough_first
+                    .peek(),
+            ),
+            trickplay_other_version: Some(
+                *state
+                    .trickplay_other_version
                     .peek(),
             ),
             ..config
@@ -510,9 +523,9 @@ fn StreamingTrickplayPanel() -> Element {
                         li { "Each play opens a second connection to the source and reads as fast as the source allows. A source that allows one connection at a time may refuse it or interrupt the video being watched. You can turn previews off for one addon, or limit them to some services, where you edit that addon. A play that starts part way into a file, or jumps to a part that has no pictures yet, makes extra short requests to get there, and for a moment each jump holds one more connection to the source." }
                         li { "It uses processor time (about one CPU core while pictures are being made, at low priority) and disk space (about 9 MB for a two-hour film, up to the limit below)." }
                         li { "Pictures arrive gradually, usually several times faster than playing speed, starting at the place being watched, going on to the end and then coming back for the beginning. After a jump to a part that has no pictures yet, they are made there next. Looking far ahead of what has been read shows no picture yet. Once made, they show at once on every later play, in any version whose length gives the same number of pictures (lengths that round up to the same 10 seconds). A version of another length (an extended cut, a sped-up copy, a file holding two episodes) gets its own pictures. Two different cuts of the same length share pictures, so a preview can show the other cut." }
-                        li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source, or a failed attempt) the box is empty or grey, and some apps may show an older picture. With \"Rough previews first\" on, web-based apps can show a rough picture instead while a large video's pictures are still being made." }
+                        li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source that no other version stands in for, or a failed attempt) the box is empty or grey, and some apps may show an older picture. With \"Rough previews first\" on, web-based apps can show a rough picture instead while a large video's pictures are still being made." }
                         li { "One video is processed at a time. Other plays wait their turn and may end before their pictures are made. A video whose apps have all been silent for a minute gives way to one that is waiting, and carries on when its app reports again." }
-                        li { "Not made for Live TV, IPTV, torrents, sources set to bypass the Remux proxy, videos shorter than 5 minutes or longer than 4 hours. IPTV reached through another addon is not detected: limit that addon's previews to its other services where you edit it." }
+                        li { "Not made for Live TV, IPTV, torrents, sources set to bypass the Remux proxy, videos shorter than 5 minutes or longer than 4 hours. IPTV reached through another addon is not detected: limit that addon's previews to its other services where you edit it. With \"Use another version when the one playing cannot be read\" on, a video from an IPTV addon or one set to bypass the proxy can still get pictures made from another version." }
                     }
                 }
                 if *state.trickplay_enabled.read() {
@@ -571,6 +584,27 @@ fn StreamingTrickplayPanel() -> Element {
                             li { "A web-based app keeps a rough picture it has shown until you move the seek bar to another part of the video and back, and some may keep it a little longer. Closing the app clears it." }
                             li { "Before the detailed pictures of a video that is not finished yet, Remux makes up to 17 short reads of the source, each a few requests, and the detailed pictures start up to about 45 seconds later. Files under 4 GB (under an hour when the source gives no size), videos whose pictures are nearly finished, and sources that cannot jump within a file or reach its end within 10 seconds get no rough pictures." }
                             li { "Rough pictures are sent inside a \"not ready yet\" answer (HTTP 503), so that apps which store pictures for good do not store them. A reverse proxy set to replace error pages removes them, and previews then behave as with this off." }
+                        }
+                    }
+                    ToggleRow {
+                        label: "Use another version when the one playing cannot be read",
+                        description: "Off by default. When the version being played cannot be read for pictures (its read failed, or Remux does not read it: an IPTV addon, an addon that bypasses the proxy, or seek previews off for its addon or service), Remux reads another version of the same film or episode instead and shows its pictures.",
+                        checked: *state.trickplay_other_version.read(),
+                        disabled: *state.saving.read(),
+                        on_change: move |value| {
+                            state.trickplay_other_version.set(value);
+                            state.saved.set(false);
+                        }
+                    }
+                    div { style: "border-left:3px solid var(--warning);padding-left:10px",
+                        p { class: "field-label", "Before you turn this on:" }
+                        ol { class: "field-hint", style: "margin:0;padding-left:18px",
+                            li { "It reads a file that nobody chose to play, up to the whole file, from that file's source. This counts against that source's fair-use limits, quotas and metered connections like a play does." }
+                            li { "Only a version that is certain to fit is read: one whose own measured length gives the same number of pictures (lengths that round up to the same 10 seconds), and that is either a file of a library addon (a local folder or a WebDAV server; turn seek previews off for that addon if reading it costs you) or marked as cached by a debrid or usenet service that the addon names for each stream (only some aggregating addons send this). A cached file must also list its size, and the length Remux measured must be of a file of that size. A version that was never played or measured, one not marked cached, a plain link with no service, a torrent, and any addon or service with seek previews off are never read. For many titles no other version qualifies and nothing changes." }
+                            li { "The cached mark is as old as the last stream listing. If the file has left the service's cache since, asking for it can start a download in your account before Remux gives up on it. Before reading it, Remux asks its source once for the file's size and leaves it alone when that is not the size listed (for usenet and releases of several files, when it is larger than listed). That one request can itself start the download. If the read then ends short of the end, the pictures it made are deleted." }
+                            li { "The other version can be a different cut of the same length, or a file listed under the wrong episode that happens to have the same length, so a preview can show a scene that is not in the version being watched." }
+                            li { "At most three versions are read for one play, counting the one being played: files on this server or a WebDAV server first, then cached files, usenet last, and the smallest first within each. Another version that fails is left alone for a day. Reading stops when the viewer stops, as for any video. A user limited to some addons only gets pictures from those addons' versions." }
+                            li { "Remux cannot tell by itself that a source allows only one connection. Turn seek previews off for that addon where you edit it: its files are then never opened a second time, and with this setting on their pictures come from another version. Such a version is then listed with seek previews whenever another version can stand in for it; its preview box stays empty if that other version cannot be read." }
                         }
                     }
                 }

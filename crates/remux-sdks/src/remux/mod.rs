@@ -855,6 +855,12 @@ pub struct ServerConfiguration {
     /// `trickplay_while_streaming` is on.
     #[default(Some(false))]
     pub trickplay_rough_first: Option<bool>,
+    /// When the version being played cannot be read for trick play pictures,
+    /// read another version of the same title in its place. Off by default:
+    /// it reads a file nobody chose. Read only while
+    /// `trickplay_while_streaming` is on.
+    #[default(Some(false))]
+    pub trickplay_other_version: Option<bool>,
 }
 
 #[derive(

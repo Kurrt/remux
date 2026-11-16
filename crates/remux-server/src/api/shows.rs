@@ -136,18 +136,28 @@ pub async fn shows_episodes(
         }
     }
     // Trick play only when asked for: it needs the configuration, read once.
-    let trickplay = q
+    let trickplay_cfg = if q
         .fields
         .as_deref()
         .is_some_and(|f| f.contains(&api::ItemFields::Trickplay))
-        && crate::trickplay::enabled(
-            &db::Settings::get_config_or_default(
+    {
+        Some(
+            db::Settings::get_config_or_default(
                 &state
                     .ctx
                     .db,
             )
             .await,
-        );
+        )
+    } else {
+        None
+    };
+    let trickplay = trickplay_cfg
+        .as_ref()
+        .is_some_and(crate::trickplay::enabled);
+    let trickplay_other = trickplay_cfg
+        .as_ref()
+        .is_some_and(crate::trickplay::other_version);
     let trickplay_addons = if trickplay {
         state
             .ctx
@@ -161,7 +171,7 @@ pub async fn shows_episodes(
         .await?
         .with_permissions()
         .with_client_patches()
-        .with_trickplay(trickplay, trickplay_addons)
+        .with_trickplay(trickplay, trickplay_addons, trickplay_other)
         .build();
 
     Ok(Json(serde_json::json!({

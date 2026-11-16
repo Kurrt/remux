@@ -665,7 +665,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                     div { class: "form-group",
                                         ToggleRow {
                                             label: "Make seek previews",
-                                            description: "Only has an effect while \"Make seek previews while streaming\" is on under Streaming settings. On by default. Turn it off for an addon whose sources limit connections: making previews opens a second connection to the source for each play.",
+                                            description: "Only has an effect while \"Make seek previews while streaming\" is on under Streaming settings. On by default. Turn it off for an addon whose sources limit connections: making previews opens a second connection to the source for each play. With \"Use another version when the one playing cannot be read\" on, its videos can still get previews made from another addon's version.",
                                             checked: *edit_trickplay.read(),
                                             on_change: move |v| edit_trickplay.set(v),
                                         }

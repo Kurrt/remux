@@ -79,16 +79,20 @@ fn apply_permissions(item: &mut api::BaseItemDto, user: &db::User) {
 /// Whether each of `media`'s source rows may get trick play pictures, in the
 /// order its media sources are built. A group (one source standing for several
 /// rows) or a row with no stream information is judged by the item alone.
-/// `addons` is the snapshot of [`crate::trickplay::AddonRule`]s.
+/// `addons` is the snapshot of [`crate::trickplay::AddonRule`]s. With `other`
+/// (`TrickplayOtherVersion`), a row its addon says not to read is listed when
+/// another of the rows can be read in its place (see
+/// [`crate::trickplay::other_versions`]).
 fn trickplay_rows_ok(
     media: &db::Media,
     addons: &crate::trickplay::AddonRules,
+    other: bool,
 ) -> Vec<bool> {
-    media
+    let rows = media
         .sources
         .as_deref()
-        .unwrap_or(&[])
-        .iter()
+        .unwrap_or(&[]);
+    rows.iter()
         .map(|row| {
             row.group_id
                 .is_some()
@@ -98,7 +102,16 @@ fn trickplay_rows_ok(
                     .is_none_or(|info| {
                         let runtime = crate::trickplay::runtime_s(row, media.runtime);
                         crate::trickplay::eligible_row(row, info, runtime).is_ok()
-                            && crate::trickplay::addon_ok(addons, info)
+                            && (crate::trickplay::addon_ok(addons, info)
+                                || (other
+                                    && !crate::trickplay::other_versions(
+                                        row,
+                                        rows,
+                                        media.runtime,
+                                        addons,
+                                        |_| false,
+                                    )
+                                    .is_empty()))
                     })
         })
         .collect()
@@ -149,6 +162,7 @@ pub struct ItemsQueryResultBuilder {
     fields: Option<Vec<api::ItemFields>>,
     trickplay: bool,
     trickplay_addons: std::sync::Arc<crate::trickplay::AddonRules>,
+    trickplay_other: bool,
 }
 
 impl ItemsQueryResultBuilder {
@@ -167,6 +181,7 @@ impl ItemsQueryResultBuilder {
             fields: None,
             trickplay: false,
             trickplay_addons: std::sync::Arc::default(),
+            trickplay_other: false,
         }
     }
 
@@ -185,6 +200,7 @@ impl ItemsQueryResultBuilder {
             fields: None,
             trickplay: false,
             trickplay_addons: std::sync::Arc::default(),
+            trickplay_other: false,
         }
     }
 
@@ -221,14 +237,17 @@ impl ItemsQueryResultBuilder {
 
     /// Fill Jellyfin's `Trickplay` field, for a list whose `Fields` asks for it
     /// while trick play pictures are on. `addons` is the snapshot of
-    /// [`crate::trickplay::AddonRule`]s.
+    /// [`crate::trickplay::AddonRule`]s; `other` is
+    /// [`crate::trickplay::other_version`].
     pub fn with_trickplay(
         mut self,
         on: bool,
         addons: std::sync::Arc<crate::trickplay::AddonRules>,
+        other: bool,
     ) -> Self {
         self.trickplay = on;
         self.trickplay_addons = addons;
+        self.trickplay_other = other;
         self
     }
 
@@ -242,7 +261,13 @@ impl ItemsQueryResultBuilder {
                 .map(|m| {
                     let rows_ok = self
                         .trickplay
-                        .then(|| trickplay_rows_ok(&m, &self.trickplay_addons));
+                        .then(|| {
+                            trickplay_rows_ok(
+                                &m,
+                                &self.trickplay_addons,
+                                self.trickplay_other,
+                            )
+                        });
                     let mut dto =
                         api::db_media_to_item_for_list(m, self.hide_sources, fields);
                     if let Some(rows_ok) = rows_ok {
@@ -1177,18 +1202,28 @@ pub async fn items(
 
     //trace!(?q);
     // Trick play only when asked for: it needs the configuration, read once.
-    let trickplay = q
+    let trickplay_cfg = if q
         .fields
         .as_deref()
         .is_some_and(|f| f.contains(&api::ItemFields::Trickplay))
-        && crate::trickplay::enabled(
-            &db::Settings::get_config_or_default(
+    {
+        Some(
+            db::Settings::get_config_or_default(
                 &state
                     .ctx
                     .db,
             )
             .await,
-        );
+        )
+    } else {
+        None
+    };
+    let trickplay = trickplay_cfg
+        .as_ref()
+        .is_some_and(crate::trickplay::enabled);
+    let trickplay_other = trickplay_cfg
+        .as_ref()
+        .is_some_and(crate::trickplay::other_version);
     let trickplay_addons = if trickplay {
         state
             .ctx
@@ -1208,7 +1243,7 @@ pub async fn items(
         .await
         .with_permissions()
         .with_client_patches()
-        .with_trickplay(trickplay, trickplay_addons)
+        .with_trickplay(trickplay, trickplay_addons, trickplay_other)
         .build();
 
     Ok(Json(serde_json::json!({
@@ -2830,7 +2865,11 @@ async fn item_for_user(
             .sessions
             .trickplay
             .addon_rules();
-        let rows_ok = trickplay_rows_ok(&media, &addons);
+        let rows_ok = trickplay_rows_ok(
+            &media,
+            &addons,
+            crate::trickplay::other_version(&server_config),
+        );
         base_item.trickplay = Some(trickplay_manifest(&base_item, &rows_ok));
     }
 
@@ -9277,6 +9316,111 @@ mod tests {
         assert_visible([true, false, true]).await;
     }
 
+    /// With `TrickplayOtherVersion` on, a source its addon says not to read is
+    /// listed when another source of the title can be read in its place, and
+    /// told its own count; never with the setting off, and never when no
+    /// other source fits.
+    #[test]
+    fn trickplay_lists_a_source_not_read_when_another_stands_in() {
+        use crate::{
+            api,
+            stream::{StreamDescriptor, StreamInfo},
+            trickplay::{AddonRule, AddonRules},
+        };
+
+        let film_id = Uuid::new_v4();
+        let (off_id, on_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let rule = |trickplay: bool| AddonRule {
+            iptv: false,
+            redirect: false,
+            trickplay,
+            service_filter: vec![],
+        };
+        let rules: AddonRules = [(off_id, rule(false)), (on_id, rule(true))]
+            .into_iter()
+            .collect();
+        let row = |addon_id: Uuid,
+                   secs: i64,
+                   origin: api::ProbeOrigin,
+                   cached: Option<bool>| {
+            db::Media {
+                kind: db::MediaKind::Stream,
+                parent_id: Some(film_id),
+                stream_info: Some(StreamInfo {
+                    descriptor: StreamDescriptor::http("http://example.invalid/a.mkv"),
+                    addon_id: Some(addon_id),
+                    service_id: Some("svc-cached".to_string()),
+                    service_cached: cached,
+                    size: Some(6_000_000_000),
+                    ..Default::default()
+                }),
+                probe_data: Some(api::MediaSourceInfo {
+                    run_time_ticks: Some(secs * 10_000_000),
+                    remux: Some(api::MediaSourceRemuxInfo {
+                        provider_info: None,
+                        source: Some(origin),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        let film = |other: db::Media| db::Media {
+            id: film_id,
+            title: "The Quiet Orchard".to_string(),
+            kind: db::MediaKind::Movie,
+            runtime: Some(7_200),
+            sources: Some(vec![
+                row(off_id, 7_200, api::ProbeOrigin::Ffprobe, Some(true)),
+                other,
+            ]),
+            ..Default::default()
+        };
+
+        let fits = film(row(on_id, 7_200, api::ProbeOrigin::Ffprobe, Some(true)));
+        assert_eq!(
+            super::trickplay_rows_ok(&fits, &rules, false),
+            vec![false, true],
+            "the setting off"
+        );
+        assert_eq!(
+            super::trickplay_rows_ok(&fits, &rules, true),
+            vec![true, true]
+        );
+        let dto = api::db_media_to_item(fits.clone(), false);
+        let manifest = super::trickplay_manifest(
+            &dto,
+            &super::trickplay_rows_ok(&fits, &rules, true),
+        );
+        let counts: Vec<i32> = manifest
+            .values()
+            .map(|entry| entry["320"].thumbnail_count)
+            .collect();
+        assert_eq!(counts, vec![720, 720], "each told its own count");
+
+        for (why, other) in [
+            (
+                "another count",
+                row(on_id, 7_300, api::ProbeOrigin::Ffprobe, Some(true)),
+            ),
+            (
+                "not measured",
+                row(on_id, 7_200, api::ProbeOrigin::FilenameGuess, Some(true)),
+            ),
+            (
+                "not cached",
+                row(on_id, 7_200, api::ProbeOrigin::Ffprobe, None),
+            ),
+            (
+                "also not read",
+                row(off_id, 7_200, api::ProbeOrigin::Ffprobe, Some(true)),
+            ),
+        ] {
+            let title = film(other);
+            assert!(!super::trickplay_rows_ok(&title, &rules, true)[0], "{why}");
+        }
+    }
+
     /// A source whose stream row fails the row checks (here a torrent) gets no
     /// trick play entry; the others are keyed like `MediaSources`.
     #[test]
@@ -9314,7 +9458,7 @@ mod tests {
         };
 
         let dto = api::db_media_to_item(film.clone(), false);
-        let rows_ok = super::trickplay_rows_ok(&film, &Default::default());
+        let rows_ok = super::trickplay_rows_ok(&film, &Default::default(), false);
         assert_eq!(rows_ok, vec![true, false]);
         let manifest = super::trickplay_manifest(&dto, &rows_ok);
         let keys: Vec<&String> = manifest
