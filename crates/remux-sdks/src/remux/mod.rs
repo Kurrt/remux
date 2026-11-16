@@ -849,6 +849,12 @@ pub struct ServerConfiguration {
     /// them by age.
     #[default(Some(30_i64))]
     pub trickplay_keep_days: Option<i64>,
+    /// Before the detailed pictures, make a few spread across the whole file
+    /// and serve them as stand-ins, inside the "not ready" answer only, until
+    /// the detailed ones exist. Off by default; read only while
+    /// `trickplay_while_streaming` is on.
+    #[default(Some(false))]
+    pub trickplay_rough_first: Option<bool>,
 }
 
 #[derive(

@@ -22,9 +22,11 @@ pub struct TrickplaySheetQuery {
 
 /// One sheet of 5x5 pictures, as Jellyfin serves it. Answers 503 while the
 /// sheet is not made yet, also when no set can be found yet for this device
-/// and a film or an episode. Answers 404 for a sheet that can never exist:
-/// past the set's picture count, missing from a finished set, of an item that
-/// is neither, and whenever the switch is off.
+/// and a film or an episode; with `TrickplayRoughFirst` on, that 503 carries
+/// the sheet's rough stand-in when there is one. Answers 404 for a sheet that
+/// can never exist: past the set's picture count, missing from a finished
+/// set, of an item that is neither, and whenever the switch is off. Only a
+/// finished sheet is ever a 200.
 #[get("/videos/{id}/trickplay/{width}/{file}")]
 pub async fn trickplay_sheet(
     State(state): State<AppState>,
@@ -79,7 +81,8 @@ pub(crate) async fn serve_sheet(
     let Some(n) = trickplay::parse_sheet(req.file) else {
         return not_found();
     };
-    if !trickplay::enabled(&db::Settings::get_config_or_default(&ctx.db).await) {
+    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+    if !trickplay::enabled(&cfg) {
         return not_found();
     }
     let (set_id, pictures) =
@@ -107,7 +110,22 @@ pub(crate) async fn serve_sheet(
     let Some(bytes) = bytes else {
         let never = trickplay::is_done(&dir)
             || pictures.is_some_and(|p| u64::from(n) > trickplay::last_sheet(p));
-        return if never { not_found() } else { not_ready() };
+        if never {
+            return not_found();
+        }
+        if trickplay::rough_first(&cfg)
+            && let Some(rough) =
+                tokio::fs::read(trickplay::rough_sheet_path(root, set_id, n))
+                    .await
+                    .ok()
+                    .filter(|b| trickplay::jpeg_whole(b))
+        {
+            ctx.sessions
+                .trickplay
+                .mark_used(set_id, &dir);
+            return not_ready_with_rough(rough);
+        }
+        return not_ready();
     };
     if gap_below(ctx, root, set_id, req.device_id, n).await {
         return not_ready();
@@ -231,6 +249,21 @@ fn not_ready() -> Response {
         .into_response()
 }
 
+/// [`not_ready`], carrying the sheet's rough stand-in. Browser engines draw
+/// a picture that comes with an error status; apps that store pictures keep
+/// only a success, so they never keep this one.
+fn not_ready_with_rough(rough: Vec<u8>) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from(rough),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use axum_test::TestServer;
@@ -282,6 +315,25 @@ mod tests {
         db::Settings::set_config(&ctx.db, &cfg)
             .await
             .unwrap();
+    }
+
+    async fn set_rough(ctx: &AppContext, on: bool) {
+        let cfg = api::ServerConfiguration {
+            trickplay_rough_first: Some(on),
+            ..db::Settings::get_config_or_default(&ctx.db).await
+        };
+        db::Settings::set_config(&ctx.db, &cfg)
+            .await
+            .unwrap();
+    }
+
+    fn write_rough(ctx: &AppContext, set_id: Uuid, n: u32, bytes: &[u8]) {
+        let root = trickplay::root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        std::fs::create_dir_all(trickplay::set_dir(&root, set_id)).unwrap();
+        std::fs::write(trickplay::rough_sheet_path(&root, set_id, n), bytes).unwrap();
     }
 
     /// A film with no stream rows, so nothing but the recorded selection can
@@ -775,5 +827,118 @@ mod tests {
             let (status, _) = ask(ctx, "other-device", &film, file).await;
             assert_eq!(status, http::StatusCode::OK, "{file}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_rough_sheet_rides_only_in_the_not_ready_answer() {
+        const ROUGH: &[u8] = &[0xFF, 0xD8, b'r', b'o', b'u', b'g', b'h', 0xFF, 0xD9];
+        let dir = tempfile::tempdir().unwrap();
+        let (server, guard, token) = server_in(dir.path()).await;
+        let ctx = &guard.0;
+        set_switch(ctx, true).await;
+        let film = invented_film(ctx).await;
+        // 9,391.756 s: 940 pictures, sheets 0 to 37.
+        let v = version(ctx, &film, 0, 9_391.756).await;
+        let set_id = trickplay::set_id(&v);
+        record_selection(ctx, film.id, set_id);
+        write_rough(ctx, set_id, 3, ROUGH);
+        write_rough(ctx, set_id, 4, b"cut short");
+        let is_jpeg = |headers: &http::HeaderMap| {
+            headers
+                .get(http::header::CONTENT_TYPE)
+                .is_some_and(|v| v == "image/jpeg")
+        };
+
+        // The toggle off: rough files on disk are never sent.
+        let (status, headers, body) =
+            ask_full(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty());
+        assert!(!is_jpeg(&headers));
+
+        // On: the stand-in, inside the 503, never kept, no promise of when.
+        set_rough(ctx, true).await;
+        let (status, headers, body) =
+            ask_full(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, ROUGH);
+        assert!(is_jpeg(&headers));
+        assert_eq!(
+            headers
+                .get(http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert!(
+            headers
+                .get(http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let id = film
+            .id
+            .simple();
+        let over_http = server
+            .get(&format!("/Videos/{id}/Trickplay/320/3.jpg?ApiKey={token}"))
+            .expect_failure()
+            .await;
+        over_http.assert_status(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(over_http.header("content-type"), "image/jpeg");
+        assert_eq!(
+            over_http
+                .as_bytes()
+                .as_ref(),
+            ROUGH
+        );
+
+        // No stand-in, or one cut short: an empty 503.
+        for file in ["4.jpg", "5.jpg"] {
+            let (status, headers, body) =
+                ask_full(ctx, "test-device", &film, file).await;
+            assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{file}");
+            assert!(body.is_empty(), "{file}");
+            assert!(!is_jpeg(&headers), "{file}");
+        }
+        // Past the count, known from the version PlaybackInfo picked: 404,
+        // stand-in or not.
+        write_rough(ctx, set_id, 38, ROUGH);
+        pick(ctx, "other-device", &film, &v);
+        let (status, _, body) = ask_full(ctx, "other-device", &film, "38.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+        let (status, _, body) = ask_full(ctx, "other-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, ROUGH, "any device of the set gets the stand-in");
+
+        // The finished sheet: while the gap rule holds it back, an empty 503;
+        // then a 200 with the finished bytes, never the stand-in.
+        write_sheet_bytes(ctx, set_id, 3, b"finished");
+        let (status, _, body) = ask_full(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty(), "the gap answer carries no stand-in");
+        ctx.sessions
+            .trickplay
+            .backdate("invented-play", trickplay::START_DELAY);
+        let (status, _, body) = ask_full(ctx, "test-device", &film, "3.jpg").await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body, b"finished");
+
+        // The main switch off: 404, whatever is on disk.
+        set_switch(ctx, false).await;
+        let (status, _, body) = ask_full(ctx, "test-device", &film, "2.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+        set_switch(ctx, true).await;
+
+        // A finished set never sends a stand-in: a sheet missing from it is
+        // never made.
+        write_rough(ctx, set_id, 2, ROUGH);
+        let root = trickplay::root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        std::fs::write(trickplay::set_dir(&root, set_id).join("done"), b"").unwrap();
+        let (status, _, body) = ask_full(ctx, "test-device", &film, "2.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
     }
 }

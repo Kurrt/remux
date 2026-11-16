@@ -24,6 +24,7 @@ struct StreamingSettingsState {
     trickplay_enabled: Signal<bool>,
     trickplay_cache_mb: Signal<i64>,
     trickplay_keep_days: Signal<i64>,
+    trickplay_rough_first: Signal<bool>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -46,6 +47,7 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
         trickplay_enabled: use_signal(|| false),
         trickplay_cache_mb: use_signal(|| 1024),
         trickplay_keep_days: use_signal(|| 30),
+        trickplay_rough_first: use_signal(|| false),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -136,6 +138,12 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                                 .unwrap_or(30),
                         );
                     load_state
+                        .trickplay_rough_first
+                        .set(
+                            cfg.trickplay_rough_first
+                                .unwrap_or(false),
+                        );
+                    load_state
                         .config
                         .set(Some(cfg));
                 }
@@ -217,6 +225,11 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
             trickplay_keep_days: Some(
                 *state
                     .trickplay_keep_days
+                    .peek(),
+            ),
+            trickplay_rough_first: Some(
+                *state
+                    .trickplay_rough_first
                     .peek(),
             ),
             ..config
@@ -497,7 +510,7 @@ fn StreamingTrickplayPanel() -> Element {
                         li { "Each play opens a second connection to the source and reads as fast as the source allows. A source that allows one connection at a time may refuse it or interrupt the video being watched. You can turn previews off for one addon, or limit them to some services, where you edit that addon. A play that starts part way into a file, or jumps to a part that has no pictures yet, makes extra short requests to get there, and for a moment each jump holds one more connection to the source." }
                         li { "It uses processor time (about one CPU core while pictures are being made, at low priority) and disk space (about 9 MB for a two-hour film, up to the limit below)." }
                         li { "Pictures arrive gradually, usually several times faster than playing speed, starting at the place being watched, going on to the end and then coming back for the beginning. After a jump to a part that has no pictures yet, they are made there next. Looking far ahead of what has been read shows no picture yet. Once made, they show at once on every later play, in any version whose length gives the same number of pictures (lengths that round up to the same 10 seconds). A version of another length (an extended cut, a sped-up copy, a file holding two episodes) gets its own pictures. Two different cuts of the same length share pictures, so a preview can show the other cut." }
-                        li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source, or a failed attempt) the box is empty or grey, and some apps may show an older picture." }
+                        li { "While this is on, apps show a preview box for every video. Where no picture has been made (not made yet, an excluded source, or a failed attempt) the box is empty or grey, and some apps may show an older picture. With \"Rough previews first\" on, web-based apps can show a rough picture instead while a large video's pictures are still being made." }
                         li { "One video is processed at a time. Other plays wait their turn and may end before their pictures are made. A video whose apps have all been silent for a minute gives way to one that is waiting, and carries on when its app reports again." }
                         li { "Not made for Live TV, IPTV, torrents, sources set to bypass the Remux proxy, videos shorter than 5 minutes or longer than 4 hours. IPTV reached through another addon is not detected: limit that addon's previews to its other services where you edit it." }
                     }
@@ -539,6 +552,26 @@ fn StreamingTrickplayPanel() -> Element {
                             },
                         }
                         p { class: "field-hint", "Pictures not shown for this many days are deleted. 0 never deletes them by age: they then go only when the disk space above is full." }
+                    }
+                    ToggleRow {
+                        label: "Rough previews first",
+                        description: "Off by default. For a large file, Remux first makes up to 17 pictures spread across the whole video (the start, the end, the middle, then the points halfway between), each with its own short request. About a minute into a first play, every place on the seek bar then shows the nearest of them. Detailed pictures take their place as they are made.",
+                        checked: *state.trickplay_rough_first.read(),
+                        disabled: *state.saving.read(),
+                        on_change: move |value| {
+                            state.trickplay_rough_first.set(value);
+                            state.saved.set(false);
+                        }
+                    }
+                    div { style: "border-left:3px solid var(--warning);padding-left:10px",
+                        p { class: "field-label", "Before you turn this on:" }
+                        ol { class: "field-hint", style: "margin:0;padding-left:18px",
+                            li { "Only the Jellyfin web client shows the rough pictures: in a browser, and in the TV, desktop and iOS apps built on it. A few other apps may show them too and keep them for the rest of a play. Apps that store the pictures they get ignore them and wait for the detailed pictures, as with this off, but are still sent them." }
+                            li { "A rough picture can be many minutes away from the place you skip to. It shows roughly where you are in the video, not what is at that place." }
+                            li { "A web-based app keeps a rough picture it has shown until you move the seek bar to another part of the video and back, and some may keep it a little longer. Closing the app clears it." }
+                            li { "Before the detailed pictures of a video that is not finished yet, Remux makes up to 17 short reads of the source, each a few requests, and the detailed pictures start up to about 45 seconds later. Files under 4 GB (under an hour when the source gives no size), videos whose pictures are nearly finished, and sources that cannot jump within a file or reach its end within 10 seconds get no rough pictures." }
+                            li { "Rough pictures are sent inside a \"not ready yet\" answer (HTTP 503), so that apps which store pictures for good do not store them. A reverse proxy set to replace error pages removes them, and previews then behave as with this off." }
+                        }
                     }
                 }
             }
