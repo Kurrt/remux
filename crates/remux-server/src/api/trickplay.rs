@@ -20,8 +20,11 @@ pub struct TrickplaySheetQuery {
     pub media_source_id: Option<Uuid>,
 }
 
-/// One sheet of 5x5 pictures, as Jellyfin serves it. Answers 404 until the
-/// sheet is made, and whenever the switch is off.
+/// One sheet of 5x5 pictures, as Jellyfin serves it. Answers 503 while the
+/// sheet is not made yet, also when no set can be found yet for this device
+/// and a film or an episode. Answers 404 for a sheet that can never exist:
+/// past the set's picture count, missing from a finished set, of an item that
+/// is neither, and whenever the switch is off.
 #[get("/videos/{id}/trickplay/{width}/{file}")]
 pub async fn trickplay_sheet(
     State(state): State<AppState>,
@@ -79,23 +82,35 @@ pub(crate) async fn serve_sheet(
     if !trickplay::enabled(&db::Settings::get_config_or_default(&ctx.db).await) {
         return not_found();
     }
-    let Some(set_id) =
-        resolve_set(ctx, req.user_id, req.device_id, req.id, req.media_source_id).await
-    else {
-        return not_found();
-    };
+    let (set_id, pictures) =
+        match resolve_set(ctx, req.user_id, req.device_id, req.id, req.media_source_id)
+            .await
+        {
+            Ok(found) => found,
+            // No play and no PlaybackInfo pick for this device yet: a film or
+            // an episode may still get pictures, and an app keeps a 404.
+            Err(owner) => {
+                return if can_have_pictures(ctx, owner).await {
+                    not_ready()
+                } else {
+                    not_found()
+                };
+            }
+        };
+    let dir = trickplay::set_dir(root, set_id);
     // Any sheet on disk is whole: each is renamed into place once written, and
     // a pass that ends short by itself deletes the last one it wrote.
-    let Ok(bytes) = tokio::fs::read(trickplay::sheet_path(root, set_id, n)).await
-    else {
-        return not_found();
+    let bytes = tokio::fs::read(trickplay::sheet_path(root, set_id, n))
+        .await
+        .ok()
+        .filter(|b| !b.is_empty());
+    let Some(bytes) = bytes else {
+        let never = trickplay::is_done(&dir)
+            || pictures.is_some_and(|p| u64::from(n) > trickplay::last_sheet(p));
+        return if never { not_found() } else { not_ready() };
     };
-    if bytes.is_empty() {
-        return not_found();
-    }
-    let dir = trickplay::set_dir(root, set_id);
     if gap_below(ctx, root, set_id, req.device_id, n).await {
-        return not_found();
+        return not_ready();
     }
     ctx.sessions
         .trickplay
@@ -149,19 +164,20 @@ async fn gap_below(
 /// registered, then the one of the stream its PlaybackInfo picked. Never a
 /// stream lookup: that can refresh addon streams, players ask for a sheet on
 /// nearly every move of the seek bar, and it could pick another file than
-/// the one whose pictures exist.
+/// the one whose pictures exist. With the set, its picture count when known;
+/// with no set, the item the request is for.
 async fn resolve_set(
     ctx: &AppContext,
     user_id: Uuid,
     device_id: &str,
     id: Uuid,
     media_source_id: Option<Uuid>,
-) -> Option<Uuid> {
+) -> Result<(Uuid, Option<u64>), Uuid> {
     let passes = &ctx
         .sessions
         .trickplay;
     if let Some(set_id) = passes.selected_set(id, device_id) {
-        return Some(set_id);
+        return Ok((set_id, passes.pictures_of(set_id)));
     }
     // A version held as the item id maps back to its owner, the key a play
     // registers under and PlaybackInfo saves its pick under.
@@ -169,15 +185,50 @@ async fn resolve_set(
         StreamService::version_target(ctx, Some(UserId(user_id)), id, media_source_id)
             .await;
     if let Some(set_id) = passes.selected_set(owner, device_id) {
-        return Some(set_id);
+        return Ok((set_id, passes.pictures_of(set_id)));
     }
-    let stream_id =
-        StreamService::selected_stream_id(ctx, Some(device_id), owner, source, None)?;
-    Some(trickplay::set_for_stream(ctx, stream_id).await)
+    let Some(stream_id) =
+        StreamService::selected_stream_id(ctx, Some(device_id), owner, source, None)
+    else {
+        return Err(owner);
+    };
+    Ok(trickplay::set_for_stream(ctx, stream_id).await)
+}
+
+/// Whether `owner` is a stored item that may still get pictures: a film, an
+/// episode, or a stream or stream group not under a title or channel (see
+/// [`trickplay::manifest`] and [`trickplay::set_id`]). One row read by
+/// primary key.
+async fn can_have_pictures(ctx: &AppContext, owner: Uuid) -> bool {
+    db::Media::get_by_id(&ctx.db, &owner)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|item| {
+            matches!(
+                item.kind,
+                db::MediaKind::Movie
+                    | db::MediaKind::Episode
+                    | db::MediaKind::Stream
+                    | db::MediaKind::StreamGroup
+            ) && !item.is_live()
+        })
 }
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+}
+
+/// A sheet that is not made yet, or not served yet (see [`gap_below`]). 503
+/// and never kept, so an app asks again when the seek bar comes back to it;
+/// some apps keep a 404 for good. No `Retry-After`: when it is made is not
+/// known.
+fn not_ready() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -335,6 +386,17 @@ mod tests {
         film: &db::Media,
         file: &str,
     ) -> (http::StatusCode, Vec<u8>) {
+        let (status, _, body) = ask_full(ctx, device_id, film, file).await;
+        (status, body)
+    }
+
+    /// [`ask`], with the answer's headers.
+    async fn ask_full(
+        ctx: &AppContext,
+        device_id: &str,
+        film: &db::Media,
+        file: &str,
+    ) -> (http::StatusCode, http::HeaderMap, Vec<u8>) {
         let root = trickplay::root_dir(
             &ctx.config
                 .data_dir,
@@ -353,15 +415,18 @@ mod tests {
         )
         .await;
         let status = response.status();
+        let headers = response
+            .headers()
+            .clone();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap()
             .to_vec();
-        (status, body)
+        (status, headers, body)
     }
 
     #[tokio::test]
-    async fn serves_made_sheets_and_404s_the_rest() {
+    async fn serves_made_sheets_and_503s_those_not_made() {
         let dir = tempfile::tempdir().unwrap();
         let (server, guard, token) = server_in(dir.path()).await;
         let ctx = &guard.0;
@@ -386,13 +451,33 @@ mod tests {
             b"jpeg"
         );
 
-        // Not made yet.
+        // Not made yet: 503, never kept, with no promise of when.
         let missing = server
             .get(&format!("/Videos/{id}/Trickplay/320/1.jpg?ApiKey={token}"))
             .expect_failure()
             .await;
-        missing.assert_status_not_found();
+        missing.assert_status(http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(missing.header("cache-control"), "no-store");
+        let (status, headers, _) = ask_full(ctx, "test-device", &film, "1.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            headers
+                .get(http::header::RETRY_AFTER)
+                .is_none()
+        );
+
+        // Missing from a finished set: it will never be made.
+        let root = trickplay::root_dir(
+            &ctx.config
+                .data_dir,
+        );
+        std::fs::write(trickplay::set_dir(&root, stream_id).join("done"), b"").unwrap();
+        let never = server
+            .get(&format!("/Videos/{id}/Trickplay/320/1.jpg?ApiKey={token}"))
+            .expect_failure()
+            .await;
+        never.assert_status_not_found();
+        assert_eq!(never.header("cache-control"), "no-store");
 
         // Only one width is made.
         server
@@ -419,14 +504,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_selection_is_404_without_a_stream_lookup() {
+    async fn no_selection_is_503_without_a_stream_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let (server, guard, token) = server_in(dir.path()).await;
         let ctx = &guard.0;
         set_switch(ctx, true).await;
         let film = invented_film(ctx).await;
         // A fresh stored stream with a made sheet: a stream lookup would find
-        // it, so only the route's refusal to look one up gives a 404.
+        // it, so only the route's refusal to look one up gives no 200. The
+        // film may still get pictures once played: 503, not a 404 an app
+        // keeps.
         let mut stream = db::Media {
             title: "Lantern.Keeper.1080p.mkv".to_string(),
             kind: db::MediaKind::Stream,
@@ -460,8 +547,60 @@ mod tests {
             .get(&format!("/Videos/{id}/Trickplay/320/0.jpg?ApiKey={token}"))
             .expect_failure()
             .await;
-        refused.assert_status_not_found();
+        refused.assert_status(http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(refused.header("cache-control"), "no-store");
+        let (status, headers, _) = ask_full(ctx, "test-device", &film, "0.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            headers
+                .get(http::header::RETRY_AFTER)
+                .is_none()
+        );
+
+        // A stream not under a title keeps a set of its own and may still
+        // get pictures: 503 too.
+        let mut loose = db::Media {
+            title: "Pattern.Loose.mkv".to_string(),
+            kind: db::MediaKind::Stream,
+            ..Default::default()
+        };
+        loose
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let loose_id = loose
+            .id
+            .simple();
+        let waiting = server
+            .get(&format!(
+                "/Videos/{loose_id}/Trickplay/320/0.jpg?ApiKey={token}"
+            ))
+            .expect_failure()
+            .await;
+        waiting.assert_status(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(waiting.header("cache-control"), "no-store");
+
+        // An item that can never have pictures, and one not stored: 404.
+        let mut channel = db::Media {
+            title: "Pattern Channel".to_string(),
+            kind: db::MediaKind::TvChannel,
+            ..Default::default()
+        };
+        channel
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        for item in [channel.id, Uuid::new_v4()] {
+            let item = item.simple();
+            let never = server
+                .get(&format!(
+                    "/Videos/{item}/Trickplay/320/0.jpg?ApiKey={token}"
+                ))
+                .expect_failure()
+                .await;
+            never.assert_status_not_found();
+            assert_eq!(never.header("cache-control"), "no-store");
+        }
     }
 
     #[tokio::test]
@@ -489,8 +628,10 @@ mod tests {
         };
         let own = super::serve_sheet(ctx, &root, request("test-device")).await;
         assert_eq!(own.status(), http::StatusCode::OK);
+        // Not this device's pictures: none for it yet, which it asks again
+        // for once its own play has a set.
         let other = super::serve_sheet(ctx, &root, request("other-device")).await;
-        assert_eq!(other.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(other.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -513,10 +654,35 @@ mod tests {
             ask(ctx, "test-device", &film, "0.jpg").await,
             (http::StatusCode::OK, b"from version a".to_vec())
         );
-        // Version C has another length: nothing of A's set.
+        // Version C has another length: nothing of A's set, only its own,
+        // which is not made yet.
         pick(ctx, "test-device", &film, &c);
         let (status, _) = ask(ctx, "test-device", &film, "0.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_sheet_past_the_count_is_404_and_one_within_it_503() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, guard, _token) = server_in(dir.path()).await;
+        let ctx = &guard.0;
+        set_switch(ctx, true).await;
+        let film = invented_film(ctx).await;
+        // 9,391.756 s: 940 pictures, sheets 0 to 37.
+        let v = version(ctx, &film, 0, 9_391.756).await;
+        write_sheet(ctx, trickplay::set_id(&v), 0);
+        pick(ctx, "test-device", &film, &v);
+        let (status, _) = ask(ctx, "test-device", &film, "37.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = ask(ctx, "test-device", &film, "38.jpg").await;
         assert_eq!(status, http::StatusCode::NOT_FOUND);
+
+        // A play's recorded set whose count no pass has given yet: not known,
+        // so 503.
+        let unknown = Uuid::new_v4();
+        record_selection(ctx, film.id, unknown);
+        let (status, _) = ask(ctx, "test-device", &film, "38.jpg").await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -560,15 +726,16 @@ mod tests {
         write_sheet(ctx, gapped_set, 3);
         write_sheet(ctx, gapped_set, 4);
 
-        // A device with no play, whose PlaybackInfo picked this version.
+        // A device with no play, whose PlaybackInfo picked this version: not
+        // yet, which an app asks again for.
         pick(ctx, "other-device", &film, &gapped);
         let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
         // The test device's own play, younger than the start delay.
         record_selection(ctx, film.id, gapped_set);
         let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
         // Once its play is past the start delay, that device gets what
         // exists, with no pass queued; the other device still does not.
@@ -578,14 +745,15 @@ mod tests {
         let (status, _) = ask(ctx, "test-device", &film, "3.jpg").await;
         assert_eq!(status, http::StatusCode::OK);
         let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
-        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
-        // An empty sheet is never served.
+        // An empty sheet is never served; it is made again.
         write_sheet_bytes(ctx, gapped_set, 5, b"");
         let (status, _) = ask(ctx, "test-device", &film, "5.jpg").await;
-        assert_eq!(status, http::StatusCode::NOT_FOUND);
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
 
-        // A finished set is served whole, gap or not.
+        // A finished set is served whole, gap or not, and a sheet missing
+        // from it is never made.
         let root = trickplay::root_dir(
             &ctx.config
                 .data_dir,
@@ -594,6 +762,8 @@ mod tests {
             .unwrap();
         let (status, _) = ask(ctx, "other-device", &film, "3.jpg").await;
         assert_eq!(status, http::StatusCode::OK);
+        let (status, _) = ask(ctx, "other-device", &film, "1.jpg").await;
+        assert_eq!(status, http::StatusCode::NOT_FOUND);
 
         // A set with no gap answers every sheet to anyone.
         let whole = version(ctx, &film, 1, 7_800.0).await;
