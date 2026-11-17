@@ -21,14 +21,6 @@
 //! while nobody is watching it and carries on when someone reports again, and
 //! it stops a grace period after the last of those plays ends.
 //!
-//! With `TrickplayRoughFirst` also on, a pass over a large file first makes a
-//! few single pictures spread across it, one short seek each (see
-//! [`rough_order`]), and composes stand-in sheets from them
-//! (`rough-{n}.jpg`). The sheet route sends a stand-in only inside its "not
-//! ready" answer; the finished sheet is the only success. Stand-ins are never
-//! named as sheets, and go when a compose finds their sheet made or the set is
-//! done.
-//!
 //! Who may be read is the addon's choice (see [`AddonRule`]): only streams
 //! of an enabled addon with the "seek previews" resource switched on, never
 //! IPTV, never an addon that bypasses the proxy while it gives streams, never
@@ -60,7 +52,7 @@
 //! source failed (a shorter file), the sheets it made are deleted.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -157,9 +149,8 @@ pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// the file. A source that gives none in time is read from its start.
 pub const SEEK_WAIT: Duration = Duration::from_secs(120);
 /// How long a source that gave no sheet in time after a seek (see
-/// [`SEEK_WAIT`]) is read from its start, and how long one that gave no
-/// rough picture in time at the end of the file gets no rough stage. One slow
-/// moment then does not mark it until the server restarts.
+/// [`SEEK_WAIT`]) is read from its start. One slow moment then does not
+/// mark it until the server restarts.
 pub const NO_JUMP_WAIT: Duration = Duration::from_secs(60 * 60);
 /// A run that makes no new sheet for this long has stalled: it is stopped
 /// and its stream counts as failed, so it does not hold the one slot for as
@@ -175,24 +166,6 @@ pub const FOLLOW_EVERY: Duration = Duration::from_secs(30);
 pub const MAX_FOLLOWS: u32 = 4;
 /// Directory under `data_dir` that holds every set of pictures.
 pub const ROOT_DIR: &str = "trickplay";
-/// Rough pictures made at most before the detailed ones.
-/// The admin page quotes this value.
-pub const ROUGH_PICTURES: usize = 17;
-/// The rough stage ends after this long. The admin page quotes this value.
-pub const ROUGH_BUDGET: Duration = Duration::from_secs(45);
-/// One rough picture is given up after this long.
-pub const ROUGH_SEEK_WAIT: Duration = Duration::from_secs(10);
-/// The rough stage ends after this many failed pictures in a row.
-pub const ROUGH_MAX_FAILS: u32 = 3;
-/// Smallest file, in bytes, that gets a rough stage.
-/// The admin page quotes this value.
-pub const ROUGH_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Smallest picture count (60 minutes) that gets a rough stage when the
-/// file's size is not known.
-pub const ROUGH_MIN_PICTURES: u64 = 360;
-/// Fewest sheets still to make for a rough stage, so a set that is nearly
-/// whole is not held back.
-pub const ROUGH_MIN_MISSING: usize = 4;
 
 /// Seconds of video one sheet covers.
 const SHEET_SECS: u64 = INTERVAL_SECS * (TILE_WIDTH * TILE_HEIGHT) as u64;
@@ -230,11 +203,6 @@ const STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// The longest stderr line kept; the rest of a longer one is left out.
 const STDERR_LINE_BYTES: usize = 1024;
 const TICKS_PER_SEC: i64 = 10_000_000;
-/// The rough stage composes its sheets again once this many rough pictures
-/// are on disk, and once more at its end if any were made since.
-const ROUGH_COMPOSE_AT: [usize; 5] = [2, 3, 5, 9, 17];
-/// JPEG quality of a composed rough sheet.
-const ROUGH_QUALITY: u8 = 70;
 
 /// Why a stream gets no pictures.
 #[derive(
@@ -268,15 +236,6 @@ pub enum Ineligible {
 pub fn enabled(cfg: &api::ServerConfiguration) -> bool {
     cfg.trickplay_while_streaming
         .unwrap_or(false)
-}
-
-/// Whether rough pictures are made first and sent while a sheet is not
-/// ready: both switches on.
-pub fn rough_first(cfg: &api::ServerConfiguration) -> bool {
-    enabled(cfg)
-        && cfg
-            .trickplay_rough_first
-            .unwrap_or(false)
 }
 
 /// Whether a pass starts at the position being watched and follows seeks:
@@ -335,30 +294,6 @@ pub fn sheet_path(root: &Path, set_id: Uuid, n: u32) -> PathBuf {
 /// Path of sheet `n` in a set's directory.
 fn sheet_file(dir: &Path, n: u32) -> PathBuf {
     dir.join(format!("{n}.jpg"))
-}
-
-/// Path of the rough stand-in for sheet `n` of a set (see
-/// [`compose_rough`]). Never a name [`parse_sheet`] accepts.
-pub fn rough_sheet_path(root: &Path, set_id: Uuid, n: u32) -> PathBuf {
-    rough_sheet_file(&set_dir(root, set_id), n)
-}
-
-/// Path of the rough stand-in for sheet `n` in a set's directory.
-fn rough_sheet_file(dir: &Path, n: u32) -> PathBuf {
-    dir.join(format!("rough-{n}.jpg"))
-}
-
-/// Path of rough picture `g` (its number on the 10-second grid) in a set's
-/// directory.
-fn rough_file(dir: &Path, g: u64) -> PathBuf {
-    dir.join(format!("r{g}.jpg"))
-}
-
-/// Whether bytes are a whole JPEG, as [`sheet_whole`] judges a file.
-pub fn jpeg_whole(bytes: &[u8]) -> bool {
-    bytes.len() >= 4
-        && bytes.starts_with(&[0xFF, 0xD8])
-        && bytes.ends_with(&[0xFF, 0xD9])
 }
 
 /// The runtime used to judge a stream, in seconds: the probed runtime, then
@@ -1130,260 +1065,6 @@ pub fn pass_args(input: &str, out_dir: &Path, start_sheet: u32) -> Vec<String> {
     args
 }
 
-/// ffmpeg's arguments for one rough picture at `at_s` seconds: a jump there
-/// (`-ss` before the input, to the key frame at or before it, kept as found),
-/// one key frame decoded, scaled and padded as a sheet's picture, written to
-/// `out` once whole.
-pub fn grab_args(input: &str, at_s: u64, out: &Path) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-threads",
-        "1",
-        "-filter_threads",
-        "1",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    args.extend(
-        crate::playback::engine::ffmpeg_http_input_args(input)
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    args.extend(["-skip_frame".to_string(), "nokey".to_string()]);
-    if at_s > 0 {
-        args.extend([
-            "-ss".to_string(),
-            at_s.to_string(),
-            "-noaccurate_seek".to_string(),
-        ]);
-    }
-    let filter = format!(
-        "scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,\
-         pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2"
-    );
-    args.extend([
-        "-i".to_string(),
-        input.to_string(),
-        "-an".to_string(),
-        "-sn".to_string(),
-        "-dn".to_string(),
-        "-frames:v".to_string(),
-        "1".to_string(),
-        "-vf".to_string(),
-        filter,
-        "-q:v".to_string(),
-        "5".to_string(),
-        "-f".to_string(),
-        "image2".to_string(),
-        "-atomic_writing".to_string(),
-        "1".to_string(),
-        "-update".to_string(),
-        "1".to_string(),
-        out.to_string_lossy()
-            .into_owned(),
-    ]);
-    args
-}
-
-/// The rough pictures of a file of `pictures` pictures, at most `cap`, in the
-/// order they are made: the first, the last, then the middle of every gap
-/// between two already in the list, level by level, left to right. A gap with
-/// no picture strictly inside it is left alone, so none repeats.
-pub fn rough_order(pictures: u64, cap: usize) -> Vec<u64> {
-    let mut order = Vec::new();
-    if pictures == 0 || cap == 0 {
-        return order;
-    }
-    order.push(0);
-    let last = pictures - 1;
-    if last > 0 && order.len() < cap {
-        order.push(last);
-    }
-    let mut gaps = vec![(0, last)];
-    while order.len() < cap && !gaps.is_empty() {
-        let mut next = Vec::new();
-        for (from, to) in gaps {
-            if to - from < 2 {
-                continue;
-            }
-            if order.len() >= cap {
-                break;
-            }
-            let middle = from + (to - from) / 2;
-            order.push(middle);
-            next.push((from, middle));
-            next.push((middle, to));
-        }
-        gaps = next;
-    }
-    order
-}
-
-/// The picture of `made` closest to `g`, the earlier one on a tie.
-fn nearest(made: &[u64], g: u64) -> Option<u64> {
-    made.iter()
-        .copied()
-        .min_by_key(|m| (m.abs_diff(g), *m))
-}
-
-/// Whether a pass gets a rough stage, once the switch for it is on: a source
-/// that can jump within the file, a file of at least [`ROUGH_MIN_BYTES`] (at
-/// least [`ROUGH_MIN_PICTURES`] pictures when its size is not known), and at
-/// least [`ROUGH_MIN_MISSING`] sheets still to make.
-fn rough_stage_wanted(
-    can_jump: bool,
-    size: Option<u64>,
-    pictures: u64,
-    missing: usize,
-) -> bool {
-    let large = match size {
-        Some(bytes) => bytes >= ROUGH_MIN_BYTES,
-        None => pictures >= ROUGH_MIN_PICTURES,
-    };
-    can_jump && large && missing >= ROUGH_MIN_MISSING
-}
-
-/// The rough pictures on disk (`r{g}.jpg`, whole), below `pictures`, lowest
-/// first.
-fn rough_made(dir: &Path, pictures: u64) -> Vec<u64> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut made: Vec<u64> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let g = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix('r'))
-                .and_then(parse_sheet)
-                .map(u64::from)?;
-            (g < pictures && sheet_whole(&entry.path())).then_some(g)
-        })
-        .collect();
-    made.sort_unstable();
-    made
-}
-
-/// Deletes each rough stand-in whose sheet is on disk and whole.
-fn drop_rough_made(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let n = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_prefix("rough-"))
-            .and_then(parse_sheet);
-        if let Some(n) = n
-            && sheet_whole(&sheet_file(dir, n))
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Deletes every rough picture and rough stand-in in a set's directory.
-fn drop_rough(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let rough = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| {
-                name.strip_prefix("rough-")
-                    .or_else(|| name.strip_prefix('r'))
-                    .and_then(parse_sheet)
-                    .is_some()
-            });
-        if rough {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Composes a rough stand-in for every sheet of a set of `pictures` pictures
-/// whose sheet is not on disk: each tile is the rough picture nearest to its
-/// place, black past the last picture. Stand-ins of sheets on disk are
-/// deleted. Nothing is written with fewer than two rough pictures that
-/// decode. Each stand-in is written beside its name and renamed into place.
-fn compose_rough(dir: &Path, pictures: u64) -> std::io::Result<()> {
-    let mut made: BTreeMap<u64, image::RgbImage> = BTreeMap::new();
-    for g in rough_made(dir, pictures) {
-        let Ok(bytes) = std::fs::read(rough_file(dir, g)) else {
-            continue;
-        };
-        let Ok(picture) =
-            image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
-        else {
-            continue;
-        };
-        let picture = picture.into_rgb8();
-        if picture.dimensions() == (WIDTH, HEIGHT) {
-            made.insert(g, picture);
-        }
-    }
-    drop_rough_made(dir);
-    if made.len() < 2 {
-        return Ok(());
-    }
-    let keys: Vec<u64> = made
-        .keys()
-        .copied()
-        .collect();
-    let per_sheet = u64::from(TILE_WIDTH * TILE_HEIGHT);
-    for n in 0..=last_sheet(pictures) {
-        let Ok(n) = u32::try_from(n) else {
-            break;
-        };
-        if sheet_whole(&sheet_file(dir, n)) {
-            continue;
-        }
-        let mut canvas = image::RgbImage::new(WIDTH * TILE_WIDTH, HEIGHT * TILE_HEIGHT);
-        for t in 0..TILE_WIDTH * TILE_HEIGHT {
-            let g = u64::from(n) * per_sheet + u64::from(t);
-            if g >= pictures {
-                break;
-            }
-            let Some(picture) = nearest(&keys, g).and_then(|k| made.get(&k)) else {
-                continue;
-            };
-            let x = i64::from(t % TILE_WIDTH * WIDTH);
-            let y = i64::from(t / TILE_WIDTH * HEIGHT);
-            image::imageops::replace(&mut canvas, picture, x, y);
-        }
-        let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, ROUGH_QUALITY)
-            .encode_image(&canvas)
-            .map_err(std::io::Error::other)?;
-        let path = rough_sheet_file(dir, n);
-        let tmp = dir.join(format!("rough-{n}.jpg.tmp"));
-        std::fs::write(&tmp, &out)?;
-        std::fs::rename(&tmp, &path)?;
-    }
-    Ok(())
-}
-
-/// [`compose_rough`] off the async threads; a failure is logged and leaves
-/// the stand-ins there were.
-async fn compose_rough_logged(dir: &Path, pictures: u64) {
-    let dir = dir.to_path_buf();
-    let composed =
-        tokio::task::spawn_blocking(move || compose_rough(&dir, pictures)).await;
-    match composed {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "could not compose rough trick play sheets"),
-        Err(error) => warn!(%error, "could not compose rough trick play sheets"),
-    }
-}
-
 /// The number of the last sheet `pictures` fill.
 pub fn last_sheet(pictures: u64) -> u64 {
     pictures.saturating_sub(1) / u64::from(TILE_WIDTH * TILE_HEIGHT)
@@ -1991,16 +1672,15 @@ fn drop_on_trial(plan: &PassPlan, dir: &Path, sheets: &[u32]) {
     );
 }
 
-/// Deletes what another version made in this slot, its sheets on trial and
-/// its rough pictures, when its read is stopped before its length was
-/// checked. Nothing for the version played.
+/// Deletes the sheets on trial that another version made in this slot,
+/// when its read is stopped before its length was checked. Nothing for the
+/// version played.
 fn drop_stand_in(plan: &PassPlan, dir: &Path, on_trial: &[u32]) {
     if plan
         .other_version
         .is_some()
     {
         drop_on_trial(plan, dir, on_trial);
-        drop_rough(dir);
     }
 }
 
@@ -2484,14 +2164,6 @@ async fn resolve_plan(
                 .saturating_mul(TICKS_PER_SEC)
         });
     let pictures = picture_count(ticks);
-    let rough = rough_first(&cfg);
-    let estimate = estimate_bytes(runtime_s);
-    // Rough stand-ins add about half again while the set is unfinished.
-    let estimate = if rough {
-        estimate + estimate / 2
-    } else {
-        estimate
-    };
     let set_id = set_for(&root, &stream);
     let rules = ctx
         .sessions
@@ -2518,9 +2190,8 @@ async fn resolve_plan(
             .size
             .and_then(|s| u64::try_from(s).ok())
             .filter(|s| *s > 0),
-        estimate,
+        estimate: estimate_bytes(runtime_s),
         played: info.clone(),
-        rough,
         from_position: start_at_position(&cfg),
         db: Some(
             ctx.db
@@ -3094,8 +2765,6 @@ pub(crate) struct PassPlan {
     /// against the addon rules as they are at slot entry and while it is
     /// read (see [`addon_ok`]).
     pub played: StreamInfo,
-    /// Make rough pictures first (see [`rough_first`]).
-    pub rough: bool,
     /// Start at the viewer's sheet and follow seeks (see
     /// [`start_at_position`]).
     pub from_position: bool,
@@ -3194,35 +2863,9 @@ pub(crate) struct RunResult {
     pub stderr: String,
 }
 
-/// What a runner is given for one rough picture.
-#[derive(Debug, Clone)]
-pub(crate) struct GrabJob {
-    pub input: String,
-    /// Where in the file, in seconds.
-    pub at_s: u64,
-    /// The picture's file (see [`rough_file`]).
-    pub out: PathBuf,
-    /// Given up after this long.
-    pub wait: Duration,
-    /// Set to the child's pid once it runs.
-    pub pid: Arc<AtomicU32>,
-}
-
-/// How one rough picture ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Grab {
-    /// The picture is on disk and whole.
-    Made,
-    /// ffmpeg ended by itself without a whole picture.
-    Failed,
-    /// Killed at the end of its wait.
-    TimedOut,
-    Cancelled,
-}
-
-/// Makes the pictures of one run, and single rough pictures; ffmpeg in
-/// production, a fake in tests. Each must stop, and wait for its process to
-/// exit, once `cancel` resolves (a stop sent or the sender dropped).
+/// Makes the pictures of one run; ffmpeg in production, a fake in tests.
+/// It must stop, and wait for its process to exit, once `cancel` resolves
+/// (a stop sent or the sender dropped).
 pub(crate) trait PassRunner: Send + Sync + 'static {
     fn run(
         &self,
@@ -3230,18 +2873,12 @@ pub(crate) trait PassRunner: Send + Sync + 'static {
         cancel: oneshot::Receiver<()>,
     ) -> impl Future<Output = RunResult> + Send;
 
-    fn grab(
-        &self,
-        job: GrabJob,
-        cancel: oneshot::Receiver<()>,
-    ) -> impl Future<Output = Grab> + Send;
-
     /// The size in bytes of the file at `input`, as its source gives it now,
     /// or `None` when it gives none.
     fn size(&self, input: &str) -> impl Future<Output = Option<u64>> + Send;
 }
 
-/// Runs ffmpeg at low priority with [`pass_args`] and [`grab_args`].
+/// Runs ffmpeg at low priority with [`pass_args`].
 pub(crate) struct FfmpegRunner;
 
 impl PassRunner for FfmpegRunner {
@@ -3251,14 +2888,6 @@ impl PassRunner for FfmpegRunner {
         cancel: oneshot::Receiver<()>,
     ) -> impl Future<Output = RunResult> + Send {
         run_ffmpeg(job, cancel)
-    }
-
-    fn grab(
-        &self,
-        job: GrabJob,
-        cancel: oneshot::Receiver<()>,
-    ) -> impl Future<Output = Grab> + Send {
-        run_grab(job, cancel)
     }
 
     fn size(&self, input: &str) -> impl Future<Output = Option<u64>> + Send {
@@ -3310,75 +2939,6 @@ async fn source_size(input: String) -> Option<u64> {
         response.content_length()
     } else {
         None
-    }
-}
-
-/// One rough picture by ffmpeg. Judged by its file alone: whole once ffmpeg
-/// has ended means made, whatever the exit status.
-async fn run_grab(job: GrabJob, mut cancel: oneshot::Receiver<()>) -> Grab {
-    let mut cmd = tokio::process::Command::new(crate::tools::ffmpeg());
-    cmd.hide_console();
-    cmd.kill_on_drop(true);
-    cmd.args(grab_args(&job.input, job.at_s, &job.out));
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            debug!(%error, "could not start ffmpeg for a rough trick play picture");
-            return Grab::Failed;
-        }
-    };
-    if let Some(pid) = child.id() {
-        job.pid
-            .store(pid, Ordering::SeqCst);
-        lower_priority(pid);
-    }
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|stderr| tokio::spawn(read_stderr(stderr)));
-    let mut cancelled = false;
-    let exited = tokio::select! {
-        status = child.wait() => Some(status.ok().and_then(|s| s.code())),
-        _ = tokio::time::sleep(job.wait) => None,
-        _ = &mut cancel => {
-            cancelled = true;
-            None
-        }
-    };
-    if exited.is_none() {
-        let _ = child.start_kill();
-        let _ = child
-            .wait()
-            .await;
-    }
-    job.pid
-        .store(0, Ordering::SeqCst);
-    let stderr = match stderr_task {
-        Some(task) => task
-            .await
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    match exited {
-        _ if cancelled => Grab::Cancelled,
-        None if sheet_whole(&job.out) => Grab::Made,
-        None => {
-            debug!(at_s = job.at_s, "rough trick play picture timed out");
-            Grab::TimedOut
-        }
-        Some(_) if sheet_whole(&job.out) => Grab::Made,
-        Some(code) => {
-            debug!(
-                at_s = job.at_s,
-                exit_code = ?code,
-                stderr = %crate::playback::probe::redact_urls_in(&stderr),
-                "no rough trick play picture"
-            );
-            Grab::Failed
-        }
     }
 }
 
@@ -3595,9 +3155,6 @@ struct Limits {
     stall_wait: Duration,
     follow_every: Duration,
     max_follows: u32,
-    rough_budget: Duration,
-    rough_seek_wait: Duration,
-    rough_max_fails: u32,
 }
 
 impl Default for Limits {
@@ -3617,9 +3174,6 @@ impl Default for Limits {
             stall_wait: STALL_WAIT,
             follow_every: FOLLOW_EVERY,
             max_follows: MAX_FOLLOWS,
-            rough_budget: ROUGH_BUDGET,
-            rough_seek_wait: ROUGH_SEEK_WAIT,
-            rough_max_fails: ROUGH_MAX_FAILS,
         }
     }
 }
@@ -3683,10 +3237,6 @@ struct State {
     /// is read from its start ([`NO_JUMP_WAIT`]). By stream, as
     /// `failed_until`.
     no_jump: HashMap<Uuid, Instant>,
-    /// Until when each stream whose rough picture at the end of the file
-    /// timed out gets no rough stage ([`NO_JUMP_WAIT`]). Runs still follow
-    /// `no_jump` alone.
-    no_rough: HashMap<Uuid, Instant>,
     touched_at: HashMap<Uuid, Instant>,
     next_job: u64,
     /// The last ask of each addon kept for seek previews only for each
@@ -3750,29 +3300,6 @@ enum Stopped {
     Moved(u32),
     /// No new sheet for [`STALL_WAIT`]: the source stopped sending.
     Stalled,
-    /// The settings or the addon rules no longer let the stream be read (see
-    /// [`TrickplayPasses::refusal`]); the slot ends this way, a stream
-    /// not to be read as `Failed` (see [`refused_after_open`]).
-    Refused(SlotEnd),
-}
-
-/// How the rough stage of a pass ended (see [`TrickplayPasses::rough_stage`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoughEnd {
-    /// The pass gets no rough stage (see [`rough_stage_wanted`]).
-    Skipped,
-    /// Every picture of [`rough_order`] was tried or already on disk.
-    Through,
-    /// Its time ran out.
-    Budget,
-    /// Too many pictures failed in a row.
-    Failures,
-    /// The picture at the end of the file timed out: no rough stage for this
-    /// source for [`NO_JUMP_WAIT`].
-    NoJump,
-    /// Nobody has watched it lately: the pass gives way.
-    StoodDown,
-    Cancelled,
     /// The settings or the addon rules no longer let the stream be read (see
     /// [`TrickplayPasses::refusal`]); the slot ends this way, a stream
     /// not to be read as `Failed` (see [`refused_after_open`]).
@@ -4362,28 +3889,6 @@ impl TrickplayPasses {
             .insert(stream_id, until);
     }
 
-    /// Whether a pass over this stream may have a rough stage.
-    fn can_rough(&self, stream_id: Uuid) -> bool {
-        let now = Instant::now();
-        let mut st = self.lock();
-        st.no_rough
-            .retain(|_, until| *until > now);
-        !st.no_rough
-            .contains_key(&stream_id)
-    }
-
-    /// No rough stage for this stream for [`NO_JUMP_WAIT`].
-    fn mark_no_rough(&self, stream_id: Uuid) {
-        let until = Instant::now()
-            + self
-                .inner
-                .limits
-                .no_jump_wait;
-        self.lock()
-            .no_rough
-            .insert(stream_id, until);
-    }
-
     /// The least quiet of a set's plays, each asked of `watch` outside the
     /// lock. A play counts as quiet since it registered when its device has no
     /// reported session on its item, or when the session reporting is another
@@ -4736,7 +4241,6 @@ impl TrickplayPasses {
             .inner
             .limits;
         let mut stood_down = false;
-        let mut rough_tried = false;
         let mut size_checked = None;
         let mut read = 0;
         loop {
@@ -4795,7 +4299,6 @@ impl TrickplayPasses {
                     &mut cancel,
                     pid.clone(),
                     &watch,
-                    &mut rough_tried,
                     &mut size_checked,
                 )
                 .await;
@@ -4848,11 +4351,8 @@ impl TrickplayPasses {
 
     /// Runs a pass while holding a slot, so prune never races a pass, with
     /// `busy` in the set's folder until it ends (see [`Self::run_pass`]).
-    /// `rough_tried` keeps a job to one rough stage, whichever source it
-    /// reads, unless that stage gave way before it was through. Another
-    /// version's size is checked once a job before it is read (see
+    /// Another version's size is checked once a job before it is read (see
     /// [`is_listed_file`]); `size_checked` holds the stream last checked.
-    #[allow(clippy::too_many_arguments)]
     async fn run_in_slot<R, W>(
         &self,
         plan: &PassPlan,
@@ -4860,7 +4360,6 @@ impl TrickplayPasses {
         cancel: &mut oneshot::Receiver<()>,
         pid: Arc<AtomicU32>,
         watch: &W,
-        rough_tried: &mut bool,
         size_checked: &mut Option<Uuid>,
     ) -> SlotEnd
     where
@@ -4883,11 +4382,11 @@ impl TrickplayPasses {
             return SlotEnd::Skipped;
         }
         // Switched off, or its addon's previews turned off, while this pass
-        // waited: start nothing. The rough stage, another version and the
-        // start position follow their own switches as they are now, too, and
-        // the disk limits are the ones saved now, not those of when the play
-        // started. A change to the start position while the pass reads
-        // counts from its next turn.
+        // waited: start nothing. Another version and the start position
+        // follow their own switches as they are now, too, and the disk limits
+        // are the ones saved now, not those of when the play started. A
+        // change to the start position while the pass reads counts from its
+        // next turn.
         let cfg = match &plan.db {
             Some(pool) => Some(db::Settings::get_config_or_default(pool).await),
             None => None,
@@ -4895,18 +4394,16 @@ impl TrickplayPasses {
         if let Some(end) = self.refusal(plan, cfg.as_ref()) {
             return end;
         }
-        let (rough, from_position, cap, keep) = match &cfg {
+        let (from_position, cap, keep) = match &cfg {
             Some(cfg) => (
-                plan.rough && rough_first(cfg),
                 start_at_position(cfg),
                 cap_bytes(cfg).saturating_sub(plan.estimate),
                 keep_for(cfg),
             ),
             // No settings (tests): nothing is pruned by size or age.
-            None => (plan.rough, plan.from_position, u64::MAX, None),
+            None => (plan.from_position, u64::MAX, None),
         };
         let plan = &PassPlan {
-            rough,
             from_position,
             ..plan.clone()
         };
@@ -4987,193 +4484,11 @@ impl TrickplayPasses {
             stream_id = %plan.stream_id,
             "making trick play pictures"
         );
-        let stage = if plan.rough && !*rough_tried {
-            self.rough_stage(plan, runner, cancel, pid.clone(), watch, &dir)
-                .await
-        } else {
-            RoughEnd::Skipped
-        };
-        if stage != RoughEnd::StoodDown {
-            *rough_tried = true;
-        }
         let mut dir = dir;
-        let end = match stage {
-            RoughEnd::Cancelled => SlotEnd::Cancelled,
-            RoughEnd::StoodDown => SlotEnd::StoodDown,
-            RoughEnd::Refused(end) => {
-                // No sheet yet: a stand-in's rough pictures go.
-                drop_stand_in(plan, &dir, &[]);
-                refused_after_open(end)
-            }
-            _ => {
-                self.run_pass(plan, runner, cancel, pid, watch, &mut dir)
-                    .await
-            }
-        };
+        let end = self
+            .run_pass(plan, runner, cancel, pid, watch, &mut dir)
+            .await;
         let _ = std::fs::remove_file(dir.join(BUSY_MARKER));
-        end
-    }
-
-    /// The rough stage, before a pass's first run: each picture of
-    /// [`rough_order`] not on disk, one short jump each, composing the
-    /// stand-ins as they come (see [`ROUGH_COMPOSE_AT`]). It ends with every
-    /// picture made, after [`ROUGH_BUDGET`], after [`ROUGH_MAX_FAILS`]
-    /// failures in a row, when the picture at the end of the file times out
-    /// (the source then gets no rough stage for [`NO_JUMP_WAIT`]), when nobody has
-    /// watched the pass lately, or on a cancel. Rough pictures on disk are
-    /// kept whichever way it ends.
-    async fn rough_stage<R, W>(
-        &self,
-        plan: &PassPlan,
-        runner: &R,
-        cancel: &mut oneshot::Receiver<()>,
-        pid: Arc<AtomicU32>,
-        watch: &W,
-        dir: &Path,
-    ) -> RoughEnd
-    where
-        R: PassRunner,
-        W: Fn(&str, Uuid) -> Option<Watched>,
-    {
-        let limits = self
-            .inner
-            .limits;
-        let to_make = missing(&read_set(dir), expected_sheets(plan.pictures)).len();
-        if !rough_stage_wanted(
-            self.can_jump(plan.stream_id) && self.can_rough(plan.stream_id),
-            plan.size,
-            plan.pictures,
-            to_make,
-        ) {
-            return RoughEnd::Skipped;
-        }
-        let order = rough_order(plan.pictures, ROUGH_PICTURES);
-        let mut on_disk = rough_made(dir, plan.pictures).len();
-        let mut composed_at = None;
-        let mut fails = 0;
-        let mut made_now = 0;
-        let mut end = RoughEnd::Through;
-        let began = Instant::now();
-        info!(
-            set_id = %plan.set_id,
-            stream_id = %plan.stream_id,
-            on_disk,
-            "making rough trick play pictures first"
-        );
-        for (place, picture) in order
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            let out = rough_file(dir, picture);
-            if sheet_whole(&out) {
-                continue;
-            }
-            if !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
-                return RoughEnd::Cancelled;
-            }
-            let left = limits
-                .rough_budget
-                .saturating_sub(began.elapsed());
-            if left.is_zero() {
-                end = RoughEnd::Budget;
-                break;
-            }
-            if let Some(heard) = self.gives_way(plan.set_id, watch) {
-                info!(
-                    set_id = %plan.set_id,
-                    stream_id = %plan.stream_id,
-                    quiet_s = heard.quiet.as_secs(),
-                    "rough trick play pictures giving way: nobody has watched them lately"
-                );
-                end = RoughEnd::StoodDown;
-                break;
-            }
-            // Switched off, or its addon's previews turned off, since the
-            // last picture.
-            if let Some(refused) = self
-                .refused_now(plan)
-                .await
-            {
-                end = RoughEnd::Refused(refused);
-                break;
-            }
-            let wait = limits
-                .rough_seek_wait
-                .min(left);
-            let job = GrabJob {
-                input: plan
-                    .input
-                    .clone(),
-                at_s: picture * INTERVAL_SECS,
-                out,
-                wait,
-                pid: pid.clone(),
-            };
-            let (stop_tx, stop_rx) = oneshot::channel();
-            let mut stop = Some(stop_tx);
-            let grabbed = runner.grab(job, stop_rx);
-            tokio::pin!(grabbed);
-            let grab = loop {
-                tokio::select! {
-                    grab = &mut grabbed => break grab,
-                    _ = &mut *cancel, if stop.is_some() => {
-                        if let Some(stop) = stop.take() {
-                            let _ = stop.send(());
-                        }
-                    }
-                }
-            };
-            // The pass was stopped while this picture was being made.
-            if stop.is_none() {
-                return RoughEnd::Cancelled;
-            }
-            match grab {
-                Grab::Made => {
-                    fails = 0;
-                    made_now += 1;
-                    on_disk += 1;
-                    if ROUGH_COMPOSE_AT.contains(&on_disk) {
-                        compose_rough_logged(dir, plan.pictures).await;
-                        composed_at = Some(on_disk);
-                    }
-                }
-                // The end of the file is the farthest jump: a source that
-                // cannot make it in a whole wait is too slow for rough
-                // pictures. Whether runs may jump is left to their own check.
-                Grab::TimedOut if place == 1 && wait == limits.rough_seek_wait => {
-                    self.mark_no_rough(plan.stream_id);
-                    info!(
-                        set_id = %plan.set_id,
-                        stream_id = %plan.stream_id,
-                        "trick play: no rough picture in time at the end of the file; \
-                         no rough pictures for this source for a while"
-                    );
-                    end = RoughEnd::NoJump;
-                    break;
-                }
-                Grab::TimedOut | Grab::Failed | Grab::Cancelled => {
-                    fails += 1;
-                    if fails >= limits.rough_max_fails {
-                        end = RoughEnd::Failures;
-                        break;
-                    }
-                }
-            }
-        }
-        if made_now > 0 && on_disk >= 2 && composed_at != Some(on_disk) {
-            compose_rough_logged(dir, plan.pictures).await;
-        }
-        info!(
-            set_id = %plan.set_id,
-            stream_id = %plan.stream_id,
-            pictures = on_disk,
-            ended = ?end,
-            secs = began
-                .elapsed()
-                .as_secs(),
-            "rough trick play pictures made"
-        );
         end
     }
 
@@ -5281,14 +4596,6 @@ impl TrickplayPasses {
                 (RunEnd::Failed, _) => {
                     if result.exit_ok && !source_failed(&result) {
                         drop_on_trial(plan, dir, &on_trial);
-                        // Its rough pictures too, which `drop_on_trial`
-                        // leaves, and does not reach with no sheet made.
-                        if plan
-                            .other_version
-                            .is_some()
-                        {
-                            drop_rough(dir);
-                        }
                     }
                     return SlotEnd::Failed;
                 }
@@ -5323,12 +4630,6 @@ impl TrickplayPasses {
                         }
                         self.mark_plan_failed(plan);
                         drop_on_trial(plan, dir, &on_trial);
-                        if plan
-                            .other_version
-                            .is_some()
-                        {
-                            drop_rough(dir);
-                        }
                         info!(
                             set_id = %plan.set_id,
                             stream_id = %plan.stream_id,
@@ -5359,8 +4660,6 @@ impl TrickplayPasses {
             if let Err(e) = std::fs::write(dir.join(DONE_MARKER), b"") {
                 warn!(error = %e, "could not mark trick play pictures complete");
             }
-            // Also any left from a time the rough stage was switched on.
-            drop_rough(dir);
             info!(
                 set_id = %plan.set_id,
                 stream_id = %plan.stream_id,
@@ -5857,9 +5156,6 @@ mod tests {
             stall_wait: Duration::from_secs(60),
             follow_every: Duration::from_millis(30),
             max_follows: MAX_FOLLOWS,
-            rough_budget: Duration::from_secs(5),
-            rough_seek_wait: Duration::from_millis(200),
-            rough_max_fails: ROUGH_MAX_FAILS,
         }
     }
 
@@ -5879,7 +5175,6 @@ mod tests {
             size: None,
             estimate: 0,
             played: StreamInfo::default(),
-            rough: false,
             // Today's tests start at the viewer; the tests of the default
             // set it off.
             from_position: true,
@@ -6034,18 +5329,13 @@ mod tests {
     /// ffmpeg that ends such a run cleanly would. Each sheet
     /// takes `pace`.
     ///
-    /// A rough picture takes `grab_pace` and is written as [`JPEG`], or as a
-    /// real 320x180 picture with `real_pictures`. One in `grab_fails` ends
-    /// without a picture, one in `grab_timeouts` runs out its wait, and the
-    /// one at `grab_hang` waits to be cancelled.
-    ///
-    /// A run or rough picture of an input in `dead` makes nothing and exits
-    /// with an error, as a link that answers 404 does. An input in `empty`
-    /// makes nothing and exits 0, as a source that ends every request at once
-    /// does. An input in `long` holds one sheet more than `sheets`, one in
-    /// `short` half of them; one in `cut` is cut off half way, exiting 0 with
-    /// [`SOURCE_CUT`]. Asked its size, an input answers [`LISTED`], or
-    /// three times that when it is in `wrong_size`.
+    /// A run of an input in `dead` makes nothing and exits with an error, as
+    /// a link that answers 404 does. An input in `empty` makes nothing and
+    /// exits 0, as a source that ends every request at once does. An input in
+    /// `long` holds one sheet more than `sheets`, one in `short` half of them;
+    /// one in `cut` is cut off half way, exiting 0 with [`SOURCE_CUT`]. Asked
+    /// its size, an input answers [`LISTED`], or three times that when it is
+    /// in `wrong_size`.
     #[derive(Default)]
     struct FakeRunner {
         sheets: u64,
@@ -6060,16 +5350,6 @@ mod tests {
         /// Some run has stalled at `stall_at`; later runs pass it.
         stalled_once: AtomicBool,
         starts: Mutex<Vec<u32>>,
-        grab_pace: Duration,
-        real_pictures: bool,
-        grab_fails: Vec<u64>,
-        grab_timeouts: Vec<u64>,
-        grab_hang: Option<u64>,
-        grabs: Mutex<Vec<u64>>,
-        /// The wait each rough picture was given.
-        grab_waits: Mutex<Vec<Duration>>,
-        /// The rough files in the set's folder as each run started.
-        rough_at_runs: Mutex<Vec<Vec<String>>>,
         dead: Vec<String>,
         empty: Vec<String>,
         long: Vec<String>,
@@ -6086,14 +5366,6 @@ mod tests {
         /// The start sheet of each run so far.
         fn starts(&self) -> Vec<u32> {
             self.starts
-                .lock()
-                .unwrap()
-                .clone()
-        }
-
-        /// The rough pictures asked for so far, in order.
-        fn grabs(&self) -> Vec<u64> {
-            self.grabs
                 .lock()
                 .unwrap()
                 .clone()
@@ -6116,35 +5388,6 @@ mod tests {
         }
     }
 
-    /// The names of the rough files in a set's folder, sorted.
-    fn rough_files(dir: &Path) -> Vec<String> {
-        let mut found: Vec<String> = std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| {
-                        e.file_name()
-                            .to_str()
-                            .map(str::to_string)
-                    })
-                    .filter(|name| name.starts_with('r'))
-                    .collect()
-            })
-            .unwrap_or_default();
-        found.sort_unstable();
-        found
-    }
-
-    /// A flat 320x180 picture of one colour, as ffmpeg writes a rough one.
-    fn flat_picture(rgb: [u8; 3]) -> Vec<u8> {
-        let picture = image::RgbImage::from_pixel(WIDTH, HEIGHT, image::Rgb(rgb));
-        let mut out = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
-            .encode_image(&picture)
-            .unwrap();
-        out
-    }
-
     impl PassRunner for FakeRunner {
         fn run(
             &self,
@@ -6157,10 +5400,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(job.start_sheet);
-            self.rough_at_runs
-                .lock()
-                .unwrap()
-                .push(rough_files(&job.out_dir));
             self.inputs
                 .lock()
                 .unwrap()
@@ -6299,66 +5538,6 @@ mod tests {
                     },
                     ..Default::default()
                 }
-            }
-        }
-
-        fn grab(
-            &self,
-            job: GrabJob,
-            cancel: oneshot::Receiver<()>,
-        ) -> impl Future<Output = Grab> + Send {
-            let picture = job.at_s / INTERVAL_SECS;
-            self.grabs
-                .lock()
-                .unwrap()
-                .push(picture);
-            self.grab_waits
-                .lock()
-                .unwrap()
-                .push(job.wait);
-            let dead = self
-                .dead
-                .contains(&job.input);
-            async move {
-                let mut cancel = cancel;
-                if dead {
-                    return Grab::Failed;
-                }
-                if self.grab_hang == Some(picture) {
-                    let _ = cancel.await;
-                    return Grab::Cancelled;
-                }
-                if self
-                    .grab_timeouts
-                    .contains(&picture)
-                {
-                    tokio::select! {
-                        _ = &mut cancel => return Grab::Cancelled,
-                        _ = tokio::time::sleep(job.wait) => return Grab::TimedOut,
-                    }
-                }
-                if !self
-                    .grab_pace
-                    .is_zero()
-                {
-                    tokio::select! {
-                        _ = &mut cancel => return Grab::Cancelled,
-                        _ = tokio::time::sleep(self.grab_pace) => {}
-                    }
-                }
-                if self
-                    .grab_fails
-                    .contains(&picture)
-                {
-                    return Grab::Failed;
-                }
-                let bytes = if self.real_pictures {
-                    flat_picture([0, 0, 0])
-                } else {
-                    JPEG.to_vec()
-                };
-                std::fs::write(&job.out, bytes).unwrap();
-                Grab::Made
             }
         }
 
@@ -6530,19 +5709,6 @@ mod tests {
         assert_eq!(cfg.trickplay_cache_size_mb, Some(1024));
         assert_eq!(cfg.trickplay_keep_days, Some(30));
         assert!(!enabled(&cfg));
-        assert_eq!(cfg.trickplay_rough_first, Some(false));
-        assert!(!rough_first(&cfg));
-        let switches = |main: bool, rough: bool| api::ServerConfiguration {
-            trickplay_while_streaming: Some(main),
-            trickplay_rough_first: Some(rough),
-            ..Default::default()
-        };
-        assert!(!rough_first(&switches(true, false)));
-        assert!(
-            !rough_first(&switches(false, true)),
-            "read only while the main switch is on"
-        );
-        assert!(rough_first(&switches(true, true)));
         assert_eq!(cfg.trickplay_start_at_position, Some(false));
         assert!(!start_at_position(&cfg));
         let start = |main: bool, on: bool| api::ServerConfiguration {
@@ -10080,643 +9246,6 @@ mod tests {
         assert!(recent.exists());
     }
 
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    /// As [`until`], for up to `limit`.
-    async fn until_within(limit: Duration, mut check: impl FnMut() -> bool) {
-        let began = Instant::now();
-        while !check() {
-            assert!(
-                began.elapsed() < limit,
-                "condition not reached in {limit:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    /// A pass over a 5 GB file of `pictures` pictures into a set of its own,
-    /// with rough pictures first.
-    fn rough_plan(root: &Path, set_id: Uuid, pictures: u64) -> PassPlan {
-        PassPlan {
-            pictures,
-            size: Some(5 * GIB),
-            rough: true,
-            ..plan(root, set_id)
-        }
-    }
-
-    /// Registers `play` on device-a, begins `plan` and waits for its pass to
-    /// be over.
-    async fn play_through<W>(
-        passes: &TrickplayPasses,
-        play: &str,
-        plan: PassPlan,
-        runner: Arc<FakeRunner>,
-        watch: W,
-        limit: Duration,
-    ) where
-        W: Fn(&str, Uuid) -> Option<Watched> + Send + Sync + 'static,
-    {
-        let set_id = plan.set_id;
-        passes.register(play, Uuid::new_v4(), "device-a");
-        let begun = passes
-            .begin(play, plan, runner, watch)
-            .await;
-        assert_eq!(begun, Begin::Queued);
-        until_within(limit, || !passes.is_queued(set_id)).await;
-    }
-
-    #[test]
-    fn rough_order_starts_at_both_ends_then_halves_each_gap() {
-        assert_eq!(
-            rough_order(940, ROUGH_PICTURES),
-            vec![
-                0, 939, 469, 234, 704, 117, 351, 586, 821, 58, 175, 292, 410, 527, 645,
-                762, 880
-            ]
-        );
-        assert_eq!(rough_order(120, ROUGH_PICTURES)[..5], [0, 119, 59, 29, 89]);
-        assert_eq!(
-            rough_order(720, ROUGH_PICTURES)[..5],
-            [0, 719, 359, 179, 539]
-        );
-        assert_eq!(rough_order(940, 2), vec![0, 939]);
-        assert_eq!(rough_order(3, ROUGH_PICTURES), vec![0, 2, 1]);
-        assert_eq!(rough_order(2, ROUGH_PICTURES), vec![0, 1]);
-        assert_eq!(rough_order(1, ROUGH_PICTURES), vec![0]);
-        assert!(rough_order(0, ROUGH_PICTURES).is_empty());
-        for count in 2..=40_u64 {
-            let order = rough_order(count, ROUGH_PICTURES);
-            let unique: BTreeSet<u64> = order
-                .iter()
-                .copied()
-                .collect();
-            assert_eq!(unique.len(), order.len(), "{count}: {order:?}");
-            assert!(
-                order
-                    .iter()
-                    .all(|g| *g < count),
-                "{count}"
-            );
-            assert_eq!(
-                order.len(),
-                usize::try_from(count)
-                    .unwrap()
-                    .min(ROUGH_PICTURES),
-                "{count}"
-            );
-        }
-    }
-
-    #[test]
-    fn nearest_takes_the_closest_picture_and_the_earlier_on_a_tie() {
-        assert_eq!(nearest(&[0, 939], 469), Some(0));
-        assert_eq!(nearest(&[0, 939], 470), Some(939));
-        assert_eq!(nearest(&[0, 939], 939), Some(939));
-        assert_eq!(nearest(&[0, 469, 939], 234), Some(0));
-        assert_eq!(nearest(&[0, 468], 234), Some(0), "a tie");
-        assert_eq!(nearest(&[], 5), None);
-    }
-
-    #[test]
-    fn a_rough_stage_only_for_a_large_file_with_much_to_make_that_can_jump() {
-        assert!(rough_stage_wanted(true, Some(4 * GIB), 100, 4));
-        assert!(!rough_stage_wanted(true, Some(4 * GIB - 1), 940, 38));
-        assert!(
-            rough_stage_wanted(true, None, 360, 15),
-            "60 minutes, size unknown"
-        );
-        assert!(!rough_stage_wanted(true, None, 359, 15));
-        assert!(
-            !rough_stage_wanted(true, Some(GIB), 1_440, 58),
-            "a known size wins over the length"
-        );
-        assert!(
-            !rough_stage_wanted(true, Some(5 * GIB), 940, 3),
-            "nearly whole"
-        );
-        assert!(
-            !rough_stage_wanted(false, Some(5 * GIB), 940, 38),
-            "cannot jump"
-        );
-    }
-
-    #[test]
-    fn grab_args_jump_then_take_one_key_frame() {
-        let out = Path::new("/data/trickplay/abc/r469.jpg");
-        let input = "http://127.0.0.1:8096/stream/abc?token=t";
-        let args = grab_args(input, 4_690, out);
-        let at = |flag: &str| {
-            args.iter()
-                .position(|a| a == flag)
-                .unwrap_or_else(|| panic!("{flag} missing"))
-        };
-        assert_eq!(args[at("-ss") + 1], "4690");
-        assert!(at("-skip_frame") < at("-i"));
-        assert!(at("-ss") < at("-i"));
-        assert!(at("-noaccurate_seek") < at("-i"));
-        assert!(at("-reconnect") < at("-i"));
-        assert_eq!(args[at("-i") + 1], input);
-        assert_eq!(args[at("-frames:v") + 1], "1");
-        assert_eq!(args[at("-threads") + 1], "1");
-        assert_eq!(args[at("-atomic_writing") + 1], "1");
-        assert_eq!(args[at("-update") + 1], "1");
-        let filter = &args[at("-vf") + 1];
-        assert!(filter.contains("pad=320:180"));
-        assert!(!filter.contains("tile"));
-        assert!(!filter.contains("fps"));
-        assert_eq!(
-            args.last()
-                .map(String::as_str),
-            Some("/data/trickplay/abc/r469.jpg")
-        );
-
-        let first = grab_args("/media/invented-film.mkv", 0, out);
-        assert!(
-            !first
-                .iter()
-                .any(|a| a == "-ss"),
-            "the first picture needs no jump"
-        );
-    }
-
-    #[test]
-    fn compose_rough_puts_the_nearest_picture_in_each_tile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp
-            .path()
-            .join("set");
-        // Every sheet but 0, 18 and 37 is made: only those three get one.
-        write_sheets(&dir, (1..37).filter(|n| *n != 18));
-        std::fs::write(rough_sheet_file(&dir, 5), JPEG).unwrap();
-        std::fs::write(rough_file(&dir, 0), flat_picture([255, 0, 0])).unwrap();
-        compose_rough(&dir, 940).unwrap();
-        assert!(
-            !rough_sheet_file(&dir, 0).exists(),
-            "one rough picture composes nothing"
-        );
-        assert!(
-            !rough_sheet_file(&dir, 5).exists(),
-            "the stand-in of a sheet made goes"
-        );
-
-        std::fs::write(rough_file(&dir, 939), flat_picture([0, 0, 255])).unwrap();
-        compose_rough(&dir, 940).unwrap();
-        let read = |n: u32| {
-            let bytes = std::fs::read(rough_sheet_file(&dir, n)).unwrap();
-            assert!(jpeg_whole(&bytes));
-            image::load_from_memory(&bytes)
-                .unwrap()
-                .into_rgb8()
-        };
-        let tile = |sheet: &image::RgbImage, t: u32| {
-            sheet
-                .get_pixel(
-                    t % TILE_WIDTH * WIDTH + WIDTH / 2,
-                    t / TILE_WIDTH * HEIGHT + HEIGHT / 2,
-                )
-                .0
-        };
-        let red = |p: [u8; 3]| p[0] > 200 && p[1] < 60 && p[2] < 60;
-        let blue = |p: [u8; 3]| p[2] > 200 && p[0] < 60 && p[1] < 60;
-        let black = |p: [u8; 3]| {
-            p.iter()
-                .all(|c| *c < 30)
-        };
-        let first = read(0);
-        let middle = read(18);
-        let last = read(37);
-        assert_eq!(first.dimensions(), (1_600, 900));
-        assert!(red(tile(&first, 0)));
-        assert!(red(tile(&middle, 19)), "picture 469 is nearer the start");
-        assert!(blue(tile(&middle, 20)), "picture 470 is nearer the end");
-        assert!(blue(tile(&last, 14)), "picture 939");
-        assert!(black(tile(&last, 15)), "past the last picture");
-        assert!(black(tile(&last, 24)));
-        for n in (1..37).filter(|n| *n != 18) {
-            assert!(
-                !rough_sheet_file(&dir, n).exists(),
-                "{n}: its sheet is made"
-            );
-        }
-
-        // A sheet made since: its stand-in goes at the next compose.
-        write_sheets(&dir, [18]);
-        compose_rough(&dir, 940).unwrap();
-        assert!(!rough_sheet_file(&dir, 18).exists());
-        assert!(rough_sheet_file(&dir, 0).exists());
-        assert_eq!(sheets_in(&dir), (1..37).collect::<Vec<u32>>());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rough_files_are_never_sheets_even_after_a_crash() {
-        assert_eq!(parse_sheet("rough-3.jpg"), None);
-        assert_eq!(parse_sheet("r3.jpg"), None);
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp
-            .path()
-            .join(ROOT_DIR);
-        let dir = set_dir(&root, Uuid::new_v4());
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["r0.jpg", "r939.jpg", "rough-0.jpg", "rough-1.jpg"] {
-            std::fs::write(dir.join(name), JPEG).unwrap();
-        }
-        std::fs::write(dir.join("rough-2.jpg.tmp"), b"cut short").unwrap();
-        // A crash during the rough stage: `busy` and no sheet yet.
-        std::fs::write(dir.join(BUSY_MARKER), b"").unwrap();
-        prune_on_start(&root, true, u64::MAX, None, SystemTime::now());
-
-        let state = read_set(&dir);
-        assert!(
-            state
-                .sheets
-                .is_empty()
-        );
-        assert!(!state.end);
-        assert_eq!(
-            missing(&state, 38).len(),
-            38,
-            "every sheet is still to make"
-        );
-        assert!(!is_done(&dir));
-        assert!(
-            !dir.join(BUSY_MARKER)
-                .exists()
-        );
-        assert_eq!(
-            rough_made(&dir, 940),
-            vec![0, 939],
-            "kept for the next play"
-        );
-        assert!(sheets_in(&dir).is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_rough_stage_asks_in_the_spread_order_before_the_first_run() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-a",
-            rough_plan(tmp.path(), set_id, 940),
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), rough_order(940, ROUGH_PICTURES));
-        assert!(
-            runner
-                .grab_waits
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|wait| *wait == fast().rough_seek_wait),
-            "each picture is given the same short wait"
-        );
-        assert_eq!(runner.starts(), vec![0]);
-        let at_first_run = runner
-            .rough_at_runs
-            .lock()
-            .unwrap()[0]
-            .clone();
-        assert_eq!(
-            at_first_run
-                .iter()
-                .filter(|name| !name.starts_with("rough-"))
-                .count(),
-            ROUGH_PICTURES,
-            "{at_first_run:?}"
-        );
-        let dir = set_dir(tmp.path(), set_id);
-        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
-        assert!(is_done(&dir));
-        assert!(
-            rough_files(&dir).is_empty(),
-            "a finished set keeps no rough file"
-        );
-    }
-
-    #[tokio::test]
-    async fn rough_stand_ins_exist_before_the_first_run_and_go_once_done() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        // 100 pictures: 4 sheets, all missing. Two pictures, then three
-        // failures, so one compose.
-        let runner = Arc::new(FakeRunner {
-            sheets: 4,
-            real_pictures: true,
-            grab_fails: vec![49, 24, 74],
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-a",
-            rough_plan(tmp.path(), set_id, 100),
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), vec![0, 99, 49, 24, 74]);
-        let at_first_run = runner
-            .rough_at_runs
-            .lock()
-            .unwrap()[0]
-            .clone();
-        for n in 0..4 {
-            assert!(
-                at_first_run.contains(&format!("rough-{n}.jpg")),
-                "{n}: {at_first_run:?}"
-            );
-        }
-        let dir = set_dir(tmp.path(), set_id);
-        assert_eq!(sheets_in(&dir), vec![0, 1, 2, 3]);
-        assert!(is_done(&dir));
-        assert!(rough_files(&dir).is_empty());
-    }
-
-    #[tokio::test]
-    async fn three_failed_rough_pictures_in_a_row_end_the_stage_and_the_pass_goes_on() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_fails: vec![0, 939, 469],
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-a",
-            rough_plan(tmp.path(), set_id, 940),
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), vec![0, 939, 469]);
-        assert!(
-            passes.can_jump(set_id),
-            "a failure is not a source that cannot jump"
-        );
-        assert!(!passes.failed_recently(set_id, Instant::now()));
-        assert_eq!(runner.starts(), vec![0]);
-        let dir = set_dir(tmp.path(), set_id);
-        assert!(is_done(&dir));
-        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
-    }
-
-    #[tokio::test]
-    async fn a_rough_picture_at_the_end_that_times_out_means_no_rough_stage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let reports = Reports::default();
-        reports.at("device-a", 80 * 60);
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_timeouts: vec![939],
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-a",
-            rough_plan(tmp.path(), set_id, 940),
-            runner.clone(),
-            reports.watch(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), vec![0, 939], "no more after it");
-        assert!(!passes.can_rough(set_id));
-        assert!(
-            passes.can_jump(set_id),
-            "the runs decide that for themselves"
-        );
-        assert_eq!(runner.starts(), vec![19, 0]);
-        assert!(is_done(&set_dir(tmp.path(), set_id)));
-
-        // A time-out anywhere else is one failure; the source still jumps.
-        let other = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_timeouts: vec![469],
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-b",
-            rough_plan(tmp.path(), other, 940),
-            runner.clone(),
-            reports.watch(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), rough_order(940, ROUGH_PICTURES));
-        assert!(passes.can_rough(other));
-        assert!(passes.can_jump(other));
-        assert_eq!(runner.starts(), vec![19, 0]);
-    }
-
-    #[tokio::test]
-    async fn the_rough_stage_ends_with_its_time() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(Limits {
-            rough_budget: Duration::from_millis(120),
-            ..fast()
-        });
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_pace: Duration::from_millis(50),
-            ..Default::default()
-        });
-        play_through(
-            &passes,
-            "play-a",
-            rough_plan(tmp.path(), set_id, 940),
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        let grabs = runner.grabs();
-        assert!((1..=4).contains(&grabs.len()), "{grabs:?}");
-        assert_eq!(grabs[..], rough_order(940, ROUGH_PICTURES)[..grabs.len()]);
-        assert_eq!(runner.starts(), vec![0]);
-        assert!(is_done(&set_dir(tmp.path(), set_id)));
-    }
-
-    #[tokio::test]
-    async fn the_rough_stage_gives_way_and_later_makes_only_what_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(Limits {
-            quiet_alone: Duration::from_millis(150),
-            ..fast()
-        });
-        let reports = Reports::default();
-        reports.fresh("device-a");
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_pace: Duration::from_millis(30),
-            ..Default::default()
-        });
-        passes.register("play-a", Uuid::new_v4(), "device-a");
-        let begun = passes
-            .begin(
-                "play-a",
-                rough_plan(tmp.path(), set_id, 940),
-                runner.clone(),
-                reports.watch(),
-            )
-            .await;
-        assert_eq!(begun, Begin::Queued);
-        until(|| {
-            runner
-                .grabs()
-                .len()
-                >= 2
-        })
-        .await;
-        // The viewer has gone.
-        reports.silent("device-a", Duration::from_secs(1));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let before = runner.grabs();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(runner.grabs(), before, "stood down");
-        assert!(before.len() < ROUGH_PICTURES, "{before:?}");
-        assert_eq!(
-            runner
-                .runs
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert!(passes.is_queued(set_id));
-
-        // Back: the rest of the rough pictures, none twice, then the runs.
-        reports.fresh("device-a");
-        until_within(Duration::from_secs(10), || !passes.is_queued(set_id)).await;
-        let grabs = runner.grabs();
-        assert_eq!(grabs, rough_order(940, ROUGH_PICTURES), "none asked twice");
-        assert!(is_done(&set_dir(tmp.path(), set_id)));
-    }
-
-    #[tokio::test]
-    async fn a_cancel_during_the_rough_stage_keeps_its_pictures() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            grab_hang: Some(469),
-            ..Default::default()
-        });
-        passes.register("play-a", Uuid::new_v4(), "device-a");
-        let begun = passes
-            .begin(
-                "play-a",
-                rough_plan(tmp.path(), set_id, 940),
-                runner.clone(),
-                always(),
-            )
-            .await;
-        assert_eq!(begun, Begin::Queued);
-        until(|| {
-            runner
-                .grabs()
-                .len()
-                == 3
-        })
-        .await;
-        let dir = set_dir(tmp.path(), set_id);
-        assert!(
-            dir.join(BUSY_MARKER)
-                .exists()
-        );
-        passes.release("play-a");
-        until(|| {
-            !dir.join(BUSY_MARKER)
-                .exists()
-        })
-        .await;
-
-        assert_eq!(rough_made(&dir, 940), vec![0, 939]);
-        assert!(sheets_in(&dir).is_empty());
-        assert_eq!(
-            runner
-                .runs
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert!(!is_done(&dir));
-    }
-
-    #[tokio::test]
-    async fn no_rough_stage_switched_off_small_nearly_whole_or_unable_to_jump() {
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let off = Uuid::new_v4();
-        let small = Uuid::new_v4();
-        let nearly_whole = Uuid::new_v4();
-        let no_jump = Uuid::new_v4();
-        write_sheets(&set_dir(tmp.path(), nearly_whole), 0..35);
-        passes.mark_no_jump(no_jump);
-        let cases = [
-            (
-                off,
-                PassPlan {
-                    rough: false,
-                    ..rough_plan(tmp.path(), off, 940)
-                },
-            ),
-            (
-                small,
-                PassPlan {
-                    size: Some(2 * GIB),
-                    ..rough_plan(tmp.path(), small, 940)
-                },
-            ),
-            (nearly_whole, rough_plan(tmp.path(), nearly_whole, 940)),
-            (no_jump, rough_plan(tmp.path(), no_jump, 940)),
-        ];
-        for (i, (set_id, plan)) in cases
-            .into_iter()
-            .enumerate()
-        {
-            let runner = Arc::new(FakeRunner {
-                sheets: 38,
-                ..Default::default()
-            });
-            play_through(
-                &passes,
-                &format!("play-{i}"),
-                plan,
-                runner.clone(),
-                always(),
-                Duration::from_secs(10),
-            )
-            .await;
-            assert!(
-                runner
-                    .grabs()
-                    .is_empty(),
-                "case {i}"
-            );
-            let dir = set_dir(tmp.path(), set_id);
-            assert!(is_done(&dir), "case {i}");
-            assert!(rough_files(&dir).is_empty(), "case {i}");
-        }
-    }
-
     /// What the pass of the version played reads, in [`set_plan`].
     const PLAYED: &str = "/media/invented-film.mkv";
 
@@ -11527,70 +10056,6 @@ mod tests {
         assert!(is_done(&set_dir(tmp.path(), set_id)));
     }
 
-    #[tokio::test]
-    async fn only_the_first_source_of_a_pass_gets_a_rough_stage() {
-        // Another version read first, here inside the version played's failure
-        // wait: it gets the rough stage, under the same rules as any source.
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            ..Default::default()
-        });
-        let plan = PassPlan {
-            pictures: 940,
-            rough: true,
-            ..plan_with(tmp.path(), set_id, &[other_source("other-a")])
-        };
-        passes.mark_failed(plan.stream_id, Instant::now() + FAILURE_WAIT);
-        play_through(
-            &passes,
-            "play-a",
-            plan,
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), rough_order(940, ROUGH_PICTURES));
-        assert_eq!(runner.inputs(), strings(&["other-a"]));
-        assert!(is_done(&set_dir(tmp.path(), set_id)));
-
-        // After the version played failed, its stage was the pass's one:
-        // another version read next makes none.
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            dead: strings(&[PLAYED]),
-            ..Default::default()
-        });
-        let plan = PassPlan {
-            pictures: 940,
-            size: Some(5 * GIB),
-            rough: true,
-            ..plan_with(tmp.path(), set_id, &[other_source("other-a")])
-        };
-        play_through(
-            &passes,
-            "play-b",
-            plan,
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(
-            runner.grabs(),
-            vec![0, 939, 469],
-            "three failed, all of the version played"
-        );
-        assert_eq!(runner.inputs(), strings(&[PLAYED, "other-a"]));
-        let dir = set_dir(tmp.path(), set_id);
-        assert!(is_done(&dir));
-        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
-    }
-
     /// A line no table knows, as an ffmpeg might word a source it gave up on.
     const UNKNOWN_LINE: &str =
         "[tls @ 0x9] The specified session has been invalidated for some reason.\n";
@@ -11886,69 +10351,14 @@ mod tests {
         });
         let stream_id = Uuid::new_v4();
         passes.mark_no_jump(stream_id);
-        passes.mark_no_rough(stream_id);
         assert!(!passes.can_jump(stream_id));
-        assert!(!passes.can_rough(stream_id));
         std::thread::sleep(Duration::from_millis(80));
         assert!(passes.can_jump(stream_id), "a run may start part way again");
-        assert!(passes.can_rough(stream_id));
 
         // With the production wait, the mark holds for now.
         let passes = TrickplayPasses::new();
         passes.mark_no_jump(stream_id);
         assert!(!passes.can_jump(stream_id));
-    }
-
-    #[tokio::test]
-    async fn a_rejected_stand_ins_rough_pictures_go_with_its_sheets() {
-        // The version played failed lately, so other-a is read first and gets
-        // the rough stage; its file is shorter, so it is rejected.
-        let tmp = tempfile::tempdir().unwrap();
-        let passes = TrickplayPasses::with_limits(fast());
-        let set_id = Uuid::new_v4();
-        let runner = Arc::new(FakeRunner {
-            sheets: 38,
-            short: strings(&["other-a"]),
-            ..Default::default()
-        });
-        let plan = PassPlan {
-            pictures: 940,
-            rough: true,
-            ..plan_with(
-                tmp.path(),
-                set_id,
-                &[other_source("other-a"), other_source("other-b")],
-            )
-        };
-        passes.mark_failed(plan.stream_id, Instant::now() + FAILURE_WAIT);
-        play_through(
-            &passes,
-            "play-a",
-            plan,
-            runner.clone(),
-            always(),
-            Duration::from_secs(10),
-        )
-        .await;
-        assert_eq!(runner.grabs(), rough_order(940, ROUGH_PICTURES));
-        assert_eq!(runner.inputs(), strings(&["other-a", "other-b"]));
-        let at_runs = runner
-            .rough_at_runs
-            .lock()
-            .unwrap()
-            .clone();
-        assert!(
-            !at_runs[0].is_empty(),
-            "other-a's run had its rough pictures"
-        );
-        assert!(
-            at_runs[1].is_empty(),
-            "they went before other-b's run: {:?}",
-            at_runs[1]
-        );
-        let dir = set_dir(tmp.path(), set_id);
-        assert!(is_done(&dir));
-        assert_eq!(sheets_in(&dir), (0..38).collect::<Vec<u32>>());
     }
 
     /// Two versions of one 7,200 s title, each read from its own input, into

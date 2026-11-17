@@ -843,12 +843,6 @@ pub struct ServerConfiguration {
     /// deletes them by age. Default: 30.
     #[default(Some(30_i64))]
     pub trickplay_keep_days: Option<i64>,
-    /// Before the detailed previews, make a few trick play pictures spread
-    /// across the whole file and serve them as stand-ins, inside the "not
-    /// ready" answer only, until the detailed ones exist. Disabled by default.
-    /// Read only while `trickplay_while_streaming` is on.
-    #[default(Some(false))]
-    pub trickplay_rough_first: Option<bool>,
     /// Start making trick play pictures at the position being watched and
     /// follow seeks, instead of in order from the start of the file. Disabled
     /// by default: until a file's pictures are finished there can be a gap

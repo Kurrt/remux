@@ -15,7 +15,6 @@ struct SeekPreviewSettingsState {
     cache_mb: Signal<i64>,
     keep_days: Signal<i64>,
     start_at_position: Signal<bool>,
-    rough_first: Signal<bool>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -30,7 +29,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
         cache_mb: use_signal(|| 1024),
         keep_days: use_signal(|| 30),
         start_at_position: use_signal(|| false),
-        rough_first: use_signal(|| false),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -70,12 +68,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
                         .start_at_position
                         .set(
                             cfg.trickplay_start_at_position
-                                .unwrap_or(false),
-                        );
-                    load_state
-                        .rough_first
-                        .set(
-                            cfg.trickplay_rough_first
                                 .unwrap_or(false),
                         );
                     load_state
@@ -122,11 +114,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
             trickplay_start_at_position: Some(
                 *state
                     .start_at_position
-                    .peek(),
-            ),
-            trickplay_rough_first: Some(
-                *state
-                    .rough_first
                     .peek(),
             ),
             ..config
@@ -182,7 +169,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
                 }
                 PreviewsStoragePanel {}
                 PreviewsStartPanel {}
-                PreviewsRoughPanel {}
                 PreviewsAddonPanel {}
 
                 if let Some(error) = state.error.read().as_ref() {
@@ -364,36 +350,6 @@ fn PreviewsStartPanel() -> Element {
                 ],
                 clients: vec![
                     "Clients that load every preview when play starts may show previews at the wrong time until a video's previews are complete.",
-                ],
-                warn: true,
-            }
-        }
-    }
-}
-
-#[component]
-fn PreviewsRoughPanel() -> Element {
-    let mut state = use_context::<SeekPreviewSettingsState>();
-    rsx! {
-        Card { title: "Rough previews",
-            ToggleRow {
-                label: "Rough previews first",
-                description: "For files of 4 GB or more, first makes up to 17 pictures spread across the video and sends the nearest one until the real preview is made. Disabled by default.",
-                checked: *state.rough_first.read(),
-                disabled: *state.saving.read() || !*state.enabled.read(),
-                on_change: move |value| {
-                    state.rough_first.set(value);
-                    state.saved.set(false);
-                }
-            }
-            Notes {
-                costs: vec![
-                    "Up to 17 extra short reads of the source, and the full previews start up to 45 seconds later.",
-                ],
-                clients: vec![
-                    "Shown by the Jellyfin web client and apps built on it; other clients may ignore them.",
-                    "A rough preview can be minutes from the seek position.",
-                    "Sent as HTTP 503, so a reverse proxy that replaces error pages removes them.",
                 ],
                 warn: true,
             }

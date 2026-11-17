@@ -106,3 +106,52 @@ impl Settings {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> SqlitePool {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// A key no field reads any more, left by an earlier build, is ignored:
+    /// the rest of the document loads, and the next save drops it.
+    #[tokio::test]
+    async fn a_saved_configuration_with_a_retired_key_loads() {
+        let db = test_db().await;
+        let stored = serde_json::json!({
+            "TrickplayWhileStreaming": true,
+            "TrickplayRoughFirst": true,
+            "TrickplayStartAtPosition": true,
+        });
+        Settings::set(&db, SERVER_CONFIG_KEY, &stored.to_string())
+            .await
+            .unwrap();
+        let config = Settings::get_config(&db)
+            .await
+            .unwrap();
+        assert_eq!(config.trickplay_while_streaming, Some(true));
+        assert_eq!(config.trickplay_start_at_position, Some(true));
+        assert_eq!(config.trickplay_keep_days, Some(30));
+
+        Settings::set_config(&db, &config)
+            .await
+            .unwrap();
+        let saved = Settings::get(&db, SERVER_CONFIG_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!saved.contains("TrickplayRoughFirst"), "{saved}");
+        assert!(
+            saved.contains("\"TrickplayStartAtPosition\":true"),
+            "{saved}"
+        );
+    }
+}
