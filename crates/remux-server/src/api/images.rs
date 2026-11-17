@@ -353,10 +353,58 @@ async fn items_images_inner(
             }
         };
 
+    // Most clients cannot draw SVG, which some providers send for logos: serve
+    // a PNG made from an item's stored image, unless the client asked for SVG.
+    // One that cannot be rendered is served unchanged.
+    let is_svg = api::image::is_svg(&bytes);
+    let convert_svg = is_svg
+        && !q
+            .tag
+            .as_deref()
+            .is_some_and(|t| t.contains("://"))
+        && !opts
+            .format
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("svg"));
+    let mut svg_busy = false;
+    let svg_png = if convert_svg {
+        match ImageService::svg_as_png(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            &bytes,
+        )
+        .await
+        {
+            Ok(png) => png,
+            Err(e) => {
+                // Only a wait for a render slot that ran out is not
+                // remembered.
+                svg_busy = e.is::<tokio::time::error::Elapsed>();
+                warn!(id = %id, error = %e, "could not render SVG image, serving it as is");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // An SVG that was only waiting for a free render slot is kept briefly, so
+    // it is tried again soon. One that was refused stays refused, and is kept
+    // as long as any other image.
+    let max_age = if svg_busy { 60 } else { 86400 };
+    let served_as_svg = is_svg && svg_png.is_none();
+
     // Apply resize/quality/blur/format transforms (cached) for local images only.
     // Remote images are proxied as-is — re-encoding adds latency with no benefit.
-    let (final_bytes, content_type): (Vec<u8>, String) = if is_remote {
+    let (final_bytes, content_type): (Vec<u8>, String) = if let Some(png) = svg_png {
+        (png, "image/png".to_string())
+    } else if is_remote {
         (bytes, raw_ct)
+    } else if is_svg {
+        // A stored SVG file: name its type, which `detect_content_type`
+        // would call JPEG.
+        (bytes, "image/svg+xml".to_string())
     } else {
         let (b, ct) = ImageService::process_image(
             &state
@@ -373,14 +421,28 @@ async fn items_images_inner(
         (b, ct.to_string())
     };
 
-    Ok((
+    let mut response = (
         [
             (header::CONTENT_TYPE, content_type.to_string()),
-            (header::CACHE_CONTROL, "max-age=86400".to_string()),
+            (header::CACHE_CONTROL, format!("max-age={max_age}")),
         ],
         final_bytes,
     )
-        .into_response())
+        .into_response();
+    if served_as_svg {
+        // Opened on its own, an SVG is a document that can run scripts: it
+        // is kept from acting as a page of this server.
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static("sandbox"),
+        );
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+    }
+    Ok(response)
 }
 
 // --- GET ---
@@ -779,8 +841,11 @@ fn parse_image_kind(s: &str) -> ImageKind {
 #[cfg(test)]
 mod tests {
     use crate::{
-        db,
-        integration_test::{AUTH_HEADER, auth_header_with_token, authenticated_server},
+        Config, db,
+        integration_test::{
+            AUTH_HEADER, auth_header_with_token, authenticated_server,
+            new_test_server_with_config,
+        },
     };
     use axum::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
     use serde_json::json;
@@ -865,5 +930,144 @@ mod tests {
             .add_header(AUTHORIZATION, HeaderValue::from_str(&admin).unwrap())
             .await
             .assert_status_success();
+    }
+
+    /// Clients that cannot draw SVG showed no logo when a provider sent one:
+    /// an SVG is served as a PNG, while a malformed SVG and a raster image are
+    /// served as they come.
+    #[tokio::test]
+    async fn an_svg_item_image_is_served_as_png() {
+        const LOGO: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="100" height="100"/></svg>"#;
+        const BROKEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg"><rect"#;
+        let mut poster = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 3)
+            .write_to(&mut poster, image::ImageFormat::Png)
+            .unwrap();
+        let poster = poster.into_inner();
+
+        let upstream = httpmock::MockServer::start();
+        for (path, body) in [
+            ("/logo.svg", LOGO.as_bytes()),
+            ("/broken.svg", BROKEN.as_bytes()),
+        ] {
+            upstream.mock(|when, then| {
+                when.path(path);
+                then.status(200)
+                    .header("content-type", "image/svg+xml")
+                    .body(body);
+            });
+        }
+        upstream.mock(|when, then| {
+            when.path("/poster.png");
+            then.status(200)
+                .header("content-type", "image/png")
+                .body(&poster);
+        });
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let (server, guard) = new_test_server_with_config(Config {
+            data_dir: data_dir
+                .path()
+                .to_path_buf(),
+            database_url: Some("sqlite::memory:".into()),
+            torrent_http_port: None,
+            torrent_peer_port: None,
+            disable_dht: true,
+            disable_startup_tasks: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let ctx = &guard.0;
+        let mut movie = db::Media {
+            title: "Movie".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: Some(
+                    db::NonEmptyString::try_new("tt0000001".to_string()).unwrap(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        movie
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        for (kind, path) in [
+            (db::ImageKind::Logo, "/logo.svg"),
+            (db::ImageKind::Backdrop, "/broken.svg"),
+            (db::ImageKind::Primary, "/poster.png"),
+        ] {
+            db::MediaImage::save(
+                &ctx.db,
+                movie.id,
+                kind,
+                &upstream.url(path),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let content_type = |resp: &axum_test::TestResponse| {
+            resp.header("content-type")
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let logo = server
+            .get(&format!("/items/{}/images/logo", movie.id))
+            .await;
+        assert_eq!(content_type(&logo), "image/png");
+        let png = image::load_from_memory(logo.as_bytes()).unwrap();
+        assert!(
+            png.color()
+                .has_alpha()
+        );
+        assert_eq!((png.width(), png.height()), (1280, 640));
+
+        let broken = server
+            .get(&format!("/items/{}/images/backdrop", movie.id))
+            .await;
+        assert_eq!(content_type(&broken), "image/svg+xml");
+        // It will not render later either, so it is kept like any image.
+        assert_eq!(
+            broken
+                .header("cache-control")
+                .to_str()
+                .unwrap(),
+            "max-age=86400"
+        );
+        // Opened on its own, it cannot act as a page of this server.
+        assert_eq!(
+            broken
+                .header("content-security-policy")
+                .to_str()
+                .unwrap(),
+            "sandbox"
+        );
+        assert_eq!(&broken.as_bytes()[..], BROKEN.as_bytes());
+
+        // Once refused, it is served the same way without another try.
+        let again = server
+            .get(&format!("/items/{}/images/backdrop", movie.id))
+            .await;
+        assert_eq!(content_type(&again), "image/svg+xml");
+        assert_eq!(
+            again
+                .header("cache-control")
+                .to_str()
+                .unwrap(),
+            "max-age=86400"
+        );
+        assert_eq!(&again.as_bytes()[..], BROKEN.as_bytes());
+
+        let primary = server
+            .get(&format!("/items/{}/images/primary", movie.id))
+            .await;
+        assert_eq!(content_type(&primary), "image/png");
+        assert_eq!(&primary.as_bytes()[..], &poster[..]);
     }
 }

@@ -4,6 +4,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use futures::StreamExt;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
+use resvg::usvg::roxmltree;
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +20,89 @@ use crate::{
 /// Width/height of generated library placeholder images (16:9).
 const OUT_W: u32 = 960;
 const OUT_H: u32 = 540;
+
+/// An SVG item image larger than this is served as it is, never rendered.
+/// Title logos are a few kilobytes.
+const SVG_MAX_BYTES: usize = 256 * 1024;
+/// Longest side of a PNG rendered from an SVG. Every SVG is fitted into a
+/// square of this size, wide enough for a title logo across a TV screen; the
+/// size a client asks for is not used, as it is not for other images.
+const SVG_MAX_SIDE: u32 = 1280;
+/// Most elements an SVG may hold, counting each `<use>` as the elements it
+/// copies. The text a `<use>` copies also counts towards `SVG_MAX_BYTES`,
+/// because a copied path is built again from its data.
+const SVG_MAX_ELEMENTS: usize = 10_000;
+/// Deepest element nesting an SVG may have. The parser and renderer recurse
+/// into each level.
+const SVG_MAX_DEPTH: usize = 24;
+/// Most namespace declarations an SVG may hold. The parser copies an
+/// element's inherited namespaces into each child that declares one of its
+/// own, so many of both cost far more than the file's size suggests.
+const SVG_MAX_NAMESPACES: usize = 64;
+/// Most `<clipPath>` elements an SVG may hold.
+const SVG_MAX_CLIPS: usize = 32;
+/// Most elements the clip paths of an SVG may hold between them. A clip path
+/// is drawn again for each element it clips.
+const SVG_MAX_CLIP_ELEMENTS: usize = 64;
+/// Most `<stop>` elements a gradient may hold. A gradient fill looks through
+/// its stops for every pixel.
+const SVG_MAX_STOPS: usize = 64;
+/// Longest chain of `href` references from one element to the next, as a
+/// gradient takes what it lacks from another.
+const SVG_MAX_HREF_HOPS: usize = 8;
+/// Most text the `<style>` elements of an SVG may hold between them. Every
+/// rule in it is tested against every element.
+const SVG_MAX_STYLE_BYTES: usize = 16 * 1024;
+/// Deepest element nesting an SVG with a style sheet may have. A rule is
+/// tested against an element by trying its ancestors in turn for each part
+/// of the rule, so the work for one rule grows steeply with the depth.
+const SVG_MAX_STYLED_DEPTH: usize = 6;
+/// Longest `class` value an element of an SVG with a style sheet may have.
+/// A rule naming a class reads the whole value, for the element and again
+/// for each ancestor it tries.
+const SVG_MAX_CLASS_BYTES: usize = 64;
+/// Most attributes an element of an SVG with a style sheet may have. Each
+/// declaration applied to an element is looked up among its attributes.
+const SVG_MAX_STYLED_ATTRIBUTES: usize = 64;
+/// Most declarations a style sheet may come to once each rule has its own
+/// copy of its block, counted from the text as its selectors times its
+/// colons, which is never less.
+const SVG_MAX_STYLE_DECLARATIONS: usize = 20_000;
+/// Most a style sheet may be given to do: its bytes, or its declarations if
+/// they are more, times the elements it is applied to, the ones each `<use>`
+/// copies included.
+const SVG_MAX_STYLE_WORK: usize = 1_000_000;
+/// Most canvas the layers of one render may add up to, counted in canvases
+/// of the output size. A group with opacity or a clip path is drawn on a
+/// layer of its own, which can be larger than the output and stays in memory
+/// while the layers inside it are drawn.
+const SVG_MAX_LAYER_CANVASES: f64 = 16.0;
+/// Elements whose cost the limits above do not bound (filters, masks, markers
+/// and patterns, whose tile is drawn at whatever size it names), or that
+/// would be dropped from the PNG (text, embedded images and documents). An
+/// SVG holding one is served as it is.
+const SVG_REFUSED_ELEMENTS: &[&str] = &[
+    "filter",
+    "feImage",
+    "mask",
+    "marker",
+    "pattern",
+    "text",
+    "tref",
+    "image",
+    "foreignObject",
+];
+/// SVGs rendered at once. A render cannot be stopped once it has started, and
+/// the limits above keep its cost finite, not short: an SVG built for it (a
+/// long path drawn many times through `<use>`, or wide strokes) can hold a
+/// slot for minutes. This bounds how many do, and a request that gets no slot
+/// serves the SVG as it is.
+const SVG_MAX_RENDERS: usize = 2;
+/// How long a request waits for a render slot before serving the SVG as it is.
+const SVG_RENDER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+static SVG_RENDERS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(SVG_MAX_RENDERS));
 
 /// Black overlay opacity — matches Jellyfin's `0x78` (≈ 47%).
 const OVERLAY_ALPHA: f32 = 0x78 as f32 / 255.0;
@@ -647,12 +731,121 @@ impl ImageService {
         Ok((processed, content_type))
     }
 
+    /// Render an SVG item image as a PNG, for the many clients that cannot
+    /// draw SVG. The image is fitted, never cropped, inside `SVG_MAX_SIDE`
+    /// each way, and cached under `cache_dir()` keyed on the SVG's bytes, so
+    /// a repeat request skips the render and a changed image misses the old
+    /// file.
+    ///
+    /// Errors when the SVG is too large, is refused by `check_svg`, is
+    /// malformed or draws nothing, and when no render slot frees up in time;
+    /// the caller then serves it as it is. All but the last are remembered
+    /// beside the cache, and `Ok(None)` means this SVG was refused before, so
+    /// it is neither tried nor reported again. The last is the only error
+    /// that is a `tokio::time::error::Elapsed`.
+    pub async fn svg_as_png(
+        data_dir: &std::path::Path,
+        svg: &[u8],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let svg_key = Uuid::new_v5(&Uuid::NAMESPACE_URL, svg);
+        let dir = Self::cache_dir(data_dir);
+        let path = dir.join(format!("{svg_key}.png"));
+        let refused = dir.join(format!("{svg_key}.svg-refused"));
+        if let Some(known) = Self::svg_seen_before(&path, &refused).await {
+            return Ok(known);
+        }
+        if svg.len() > SVG_MAX_BYTES {
+            let _ = Self::write_image_to_disk(&refused, &[]).await;
+            anyhow::bail!(
+                "SVG is {} bytes, over the {SVG_MAX_BYTES} byte limit",
+                svg.len()
+            );
+        }
+
+        let permit =
+            tokio::time::timeout(SVG_RENDER_WAIT, SVG_RENDERS.acquire()).await??;
+        // Another request may have rendered this SVG while this one waited.
+        if let Some(known) = Self::svg_seen_before(&path, &refused).await {
+            return Ok(known);
+        }
+        let svg = svg.to_vec();
+        // A task of its own: a render cannot be stopped, so what comes of it
+        // is stored even when the request has gone.
+        tokio::spawn(async move {
+            let rendered = tokio::task::spawn_blocking(move || render_svg_png(&svg))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+            let stored = match rendered {
+                Ok(png) => {
+                    if let Err(e) = Self::write_cache_file(&path, &png).await {
+                        tracing::warn!(error = %e, "could not cache a PNG rendered from an SVG");
+                    }
+                    Ok(Some(png))
+                }
+                Err(e) => {
+                    // Removed with the rest of the cache, so the SVG is tried
+                    // again in time.
+                    let _ = Self::write_image_to_disk(&refused, &[]).await;
+                    Err(e)
+                }
+            };
+            // The slot is kept until the result is stored, so a request that
+            // waited for it finds that result.
+            drop(permit);
+            stored
+        })
+        .await?
+    }
+
+    /// What an earlier request left for an SVG: its PNG, or `Some(None)` when
+    /// it was refused.
+    async fn svg_seen_before(
+        path: &std::path::Path,
+        refused: &std::path::Path,
+    ) -> Option<Option<Vec<u8>>> {
+        if let Ok(png) = tokio::fs::read(path).await {
+            return Some(Some(png));
+        }
+        tokio::fs::try_exists(refused)
+            .await
+            .unwrap_or(false)
+            .then_some(None)
+    }
+
     async fn write_image_to_disk(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         tokio::fs::write(path, bytes).await?;
         Ok(())
+    }
+
+    /// Write a cache file under a temporary name and rename it into place, so
+    /// a reader never sees a partly written file and a failed write leaves
+    /// none.
+    async fn write_cache_file(
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let mut name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
+        // Ends in `.tmp`, so the cache cleaner removes one a crash left.
+        name.push(format!(".{}.tmp", Uuid::new_v4()));
+        let tmp = path.with_file_name(name);
+        let mut written = tokio::fs::write(&tmp, bytes).await;
+        if written.is_ok() {
+            written = tokio::fs::rename(&tmp, path).await;
+        }
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        Ok(written?)
     }
 
     /// Regenerate the collection image: delete cached file and DB row, then
@@ -1822,6 +2015,561 @@ fn process_image_sync(
     }
 }
 
+/// Refuse an SVG whose cost to parse and draw is not bounded by its size in
+/// bytes, and return the parsed document, which is the one that is drawn.
+/// Refused is an SVG that:
+///
+/// * has a document type with declarations of its own (the entities one can
+///   declare expand without limit), or nests deeper than `SVG_MAX_DEPTH`;
+/// * declares more than `SVG_MAX_NAMESPACES` namespaces;
+/// * has a root that is not `<svg>`, or an element in `SVG_REFUSED_ELEMENTS`;
+/// * has a filter or a dashed stroke, given by an attribute or by a style;
+/// * has more than `SVG_MAX_STYLE_BYTES` of style sheet, or a style sheet
+///   together with a selector that reads an attribute by name, nesting
+///   deeper than `SVG_MAX_STYLED_DEPTH`, a class value or an element's
+///   attributes past their limits, or more than `SVG_MAX_STYLE_DECLARATIONS`
+///   or `SVG_MAX_STYLE_WORK` for it to do;
+/// * has a gradient with more than `SVG_MAX_STOPS` stops;
+/// * has more than `SVG_MAX_CLIPS` clip paths, more than
+///   `SVG_MAX_CLIP_ELEMENTS` elements in them, one sized by the element it
+///   clips, or one whose contents could be clipped in turn: they hold a
+///   `<use>` or a `url(...)` reference, an element round the clip path holds
+///   such a reference, or a style sheet sets a clip path;
+/// * has two elements with one id;
+/// * chains `href` references in a loop, or more than `SVG_MAX_HREF_HOPS`
+///   long;
+/// * has a `<use>` whose target cannot be told for sure, or holds a `<use>`;
+/// * has more than `SVG_MAX_ELEMENTS` elements or `SVG_MAX_BYTES` bytes once
+///   each `<use>` is expanded.
+fn check_svg(text: &str) -> anyhow::Result<roxmltree::Document<'_>> {
+    // The XML parser recurses once per level of nesting, so the depth is
+    // measured first, without it. This also refuses a document type with
+    // declarations, the only place entities can be declared; a plain
+    // doctype, common in exported logos, passes.
+    svg_depth_within(text, SVG_MAX_DEPTH)?;
+    // Counted in the text: a declaration needs the attribute name itself.
+    let namespaces = text
+        .matches("xmlns")
+        .count();
+    anyhow::ensure!(
+        namespaces <= SVG_MAX_NAMESPACES,
+        "SVG declares too many namespaces"
+    );
+    let mut parsing = roxmltree::ParsingOptions::default();
+    parsing.allow_dtd = true;
+    // Elements, plus the text and comments between them.
+    parsing.nodes_limit = 2 * SVG_MAX_ELEMENTS as u32;
+    let doc = roxmltree::Document::parse_with_options(text, parsing)?;
+    anyhow::ensure!(
+        doc.root_element()
+            .has_tag_name(("http://www.w3.org/2000/svg", "svg")),
+        "not an SVG document"
+    );
+    check_svg_elements(&doc, text.len())?;
+    Ok(doc)
+}
+
+/// The rules of `check_svg` that are read from the parsed elements. `bytes`
+/// is the length of the SVG's text.
+fn check_svg_elements(doc: &roxmltree::Document, bytes: usize) -> anyhow::Result<()> {
+    let mut by_id = std::collections::HashMap::new();
+    // Elements that refer to another by `href`: their ids, and the ids they
+    // name.
+    let mut chained: Vec<(Vec<&str>, Vec<&str>)> = Vec::new();
+    let (mut elements, mut clips, mut clip_elements) = (0, 0, 0);
+    let (mut depth, mut deepest, mut in_clip) = (0, 0, 0);
+    let (mut style_bytes, mut css_clips) = (0, false);
+    // What a style sheet's cost goes by: its selectors and colons, whether it
+    // holds a selector that reads attributes by name, and the longest class
+    // value and most attributes it meets on an element.
+    let (mut style_selectors, mut style_colons, mut style_reads_attributes) =
+        (0, 0, false);
+    let (mut longest_class, mut most_attributes) = (0, 0);
+    // Walked with a list of nodes still to visit, not by recursion: each
+    // element is seen once on the way in and once on the way out.
+    let mut pending = vec![(doc.root(), false)];
+    while let Some((node, leaving)) = pending.pop() {
+        if leaving {
+            if node.is_element() {
+                depth -= 1;
+                if is_clip(node) {
+                    in_clip -= 1;
+                }
+            }
+            continue;
+        }
+        pending.push((node, true));
+        pending.extend(
+            node.children()
+                .rev()
+                .map(|child| (child, false)),
+        );
+        if !node.is_element() {
+            continue;
+        }
+        depth += 1;
+        deepest = deepest.max(depth);
+        elements += 1;
+        most_attributes = most_attributes.max(
+            node.attributes()
+                .len(),
+        );
+        longest_class = node
+            .attributes()
+            .filter(|a| a.name() == "class")
+            .map(|a| {
+                a.value()
+                    .len()
+            })
+            .fold(longest_class, usize::max);
+        // The count made before the parse saw the same levels. This one is a
+        // second guard for the renderer, which recurses into them too.
+        anyhow::ensure!(depth <= SVG_MAX_DEPTH, "SVG nests too deep");
+        let name = node
+            .tag_name()
+            .name();
+        anyhow::ensure!(!SVG_REFUSED_ELEMENTS.contains(&name), "SVG has a <{name}>");
+
+        // What sets styles here: a `style` attribute, or the sheets a
+        // `<style>` element holds.
+        let mut styles: Vec<&str> = node
+            .attribute("style")
+            .into_iter()
+            .collect();
+        if name == "style" {
+            for sheet in node
+                .children()
+                .filter_map(|c| c.text())
+            {
+                style_bytes += sheet.len();
+                style_selectors += sheet
+                    .matches([',', '{'])
+                    .count();
+                style_colons += sheet
+                    .matches(':')
+                    .count();
+                style_reads_attributes |= sheet.contains(['[', '\\']);
+                css_clips |= mentions(sheet, "clip-path");
+                styles.push(sheet);
+            }
+            anyhow::ensure!(
+                style_bytes <= SVG_MAX_STYLE_BYTES,
+                "SVG has too much style text"
+            );
+        }
+        // A filter can also be given by a function, with no element. The
+        // renderer knows an attribute by its name in any of a few namespaces,
+        // so the name is matched here in all of them.
+        let filtered = node
+            .attributes()
+            .any(|a| a.name() == "filter")
+            || styles
+                .iter()
+                .any(|s| mentions(s, "filter"));
+        anyhow::ensure!(!filtered, "SVG has a filter");
+        // The renderer cuts a dashed stroke into as many as a million pieces
+        // a path.
+        let dashed = node
+            .attributes()
+            .any(|a| a.name() == "stroke-dasharray" && !no_dashes(a.value()))
+            || styles
+                .iter()
+                .any(|s| sets_dashes(s));
+        anyhow::ensure!(!dashed, "SVG has a dashed stroke");
+        let stops = node
+            .children()
+            .filter(|c| c.has_tag_name("stop"))
+            .count();
+        anyhow::ensure!(
+            stops <= SVG_MAX_STOPS,
+            "SVG has a gradient with too many stops"
+        );
+
+        if is_clip(node) {
+            in_clip += 1;
+            clips += 1;
+            anyhow::ensure!(clips <= SVG_MAX_CLIPS, "SVG has too many clip paths");
+            // One sized by the element it clips is built again for each.
+            let by_target = node
+                .attributes()
+                .any(|a| a.name() == "clipPathUnits" && a.value() != "userSpaceOnUse");
+            anyhow::ensure!(!by_target, "SVG has a clip path sized by its target");
+            // With `inherit`, a clip path or what it holds takes a clip path
+            // from the elements round it.
+            let around = node
+                .ancestors()
+                .skip(1)
+                .any(refers);
+            anyhow::ensure!(!around, "SVG chains clip paths");
+        } else if in_clip > 0 {
+            clip_elements += 1;
+            anyhow::ensure!(
+                clip_elements <= SVG_MAX_CLIP_ELEMENTS,
+                "SVG has too much in its clip paths"
+            );
+            // A copy could bring in an element that is clipped itself.
+            anyhow::ensure!(name != "use", "SVG has a <use> in a clip path");
+        }
+        if in_clip > 0 {
+            anyhow::ensure!(!refers(node), "SVG chains clip paths");
+        }
+
+        if let Some(id) = node.attribute("id") {
+            // The renderer follows a `<use>` to the first element with its
+            // id, so with two the copy could not be told for sure.
+            let unique = by_id
+                .insert(id, node)
+                .is_none();
+            anyhow::ensure!(unique, "SVG has two elements with one id");
+        }
+        let targets: Vec<&str> = node
+            .attributes()
+            .filter(|a| a.name() == "href")
+            .filter_map(|a| href_id(a.value()))
+            .collect();
+        if !targets.is_empty() {
+            let ids = node
+                .attributes()
+                .filter(|a| a.name() == "id")
+                .map(|a| a.value())
+                .collect();
+            chained.push((ids, targets));
+        }
+    }
+
+    // A style sheet can give a clip path, or what it holds, a clip path.
+    anyhow::ensure!(
+        !(css_clips && clips > 0),
+        "SVG sets a clip path from a style sheet"
+    );
+
+    // The renderer follows `href` from one element to the next with no end
+    // when they form a loop. Each round here drops the elements whose
+    // reference ends at one with no `href`, so what is left after the last
+    // is on a loop, leads into one, or is a longer chain than allowed. Every
+    // id and `href` an element has is counted, in any namespace, so no chain
+    // the renderer follows is missed.
+    for _ in 0..SVG_MAX_HREF_HOPS {
+        let linked: HashSet<&str> = chained
+            .iter()
+            .flat_map(|(ids, _)| ids)
+            .copied()
+            .collect();
+        chained.retain(|(_, targets)| {
+            targets
+                .iter()
+                .any(|id| linked.contains(id))
+        });
+    }
+    anyhow::ensure!(
+        chained.is_empty(),
+        "SVG chains references in a loop or too far"
+    );
+
+    let mut bytes = bytes;
+    for node in doc
+        .descendants()
+        .filter(|n| n.has_tag_name("use"))
+    {
+        let plain = node.attribute("href");
+        let xlink = node.attribute(("http://www.w3.org/1999/xlink", "href"));
+        anyhow::ensure!(
+            plain.is_none() || xlink.is_none() || plain == xlink,
+            "SVG has a <use> with two targets"
+        );
+        // The renderer reads `xlink:href` first.
+        let Some(href) = xlink.or(plain) else {
+            continue;
+        };
+        // It also skips spaces round a reference and ends the id at one, so
+        // only a plain `#id` is sure to name the same element there as here.
+        let target = href
+            .strip_prefix('#')
+            .filter(|id| !id.contains(char::is_whitespace))
+            .and_then(|id| by_id.get(id));
+        let Some(target) = target else {
+            anyhow::bail!("SVG has a <use> that cannot be followed");
+        };
+        anyhow::ensure!(
+            !target
+                .descendants()
+                .any(|n| n.has_tag_name("use")),
+            "SVG uses a <use> inside a <use>"
+        );
+        elements += target
+            .descendants()
+            .filter(|n| n.is_element())
+            .count();
+        anyhow::ensure!(elements <= SVG_MAX_ELEMENTS, "SVG has too many elements");
+        // A copied path is built again from its data.
+        bytes += target
+            .range()
+            .len();
+        anyhow::ensure!(
+            bytes <= SVG_MAX_BYTES,
+            "SVG is too large once each <use> is expanded"
+        );
+    }
+    anyhow::ensure!(elements <= SVG_MAX_ELEMENTS, "SVG has too many elements");
+
+    // Every rule of a style sheet is tested against every element, the
+    // copies a `<use>` makes included, and through its ancestors; what
+    // matches is then applied one declaration at a time. A selector that
+    // reads an attribute by name could read one of any length, so a sheet
+    // holding one is refused.
+    if style_bytes > 0 {
+        let declarations = style_selectors * style_colons;
+        anyhow::ensure!(
+            !style_reads_attributes
+                && deepest <= SVG_MAX_STYLED_DEPTH
+                && longest_class <= SVG_MAX_CLASS_BYTES
+                && most_attributes <= SVG_MAX_STYLED_ATTRIBUTES
+                && declarations <= SVG_MAX_STYLE_DECLARATIONS
+                && style_bytes.max(declarations) * elements <= SVG_MAX_STYLE_WORK,
+            "SVG's style sheet has too much to match"
+        );
+    }
+    Ok(())
+}
+
+/// Errors when an element of `text` is nested deeper than `limit`, found by
+/// one pass over the bytes with no recursion. It splits the text into
+/// comments, CDATA sections, processing instructions and tags as XML does, so
+/// for any text the parser accepts it counts the same levels. A document type
+/// with declarations of its own is refused: they could define text that holds
+/// elements.
+fn svg_depth_within(text: &str, limit: usize) -> anyhow::Result<()> {
+    let bytes = text.as_bytes();
+    let find = |from: usize, what: &[u8]| {
+        bytes
+            .get(from..)
+            .and_then(|rest| {
+                rest.windows(what.len())
+                    .position(|w| w == what)
+            })
+            .map(|at| from + at + what.len())
+    };
+    let mut depth = 0usize;
+    let mut at = 0;
+    while let Some(open) = find(at, b"<") {
+        let rest = &bytes[open..];
+        // Where this piece of markup ends. Text that stops inside one is not
+        // XML, and the parser refuses it before going deeper.
+        let end = if rest.starts_with(b"!--") {
+            find(open + 3, b"-->")
+        } else if rest.starts_with(b"![CDATA[") {
+            find(open + 8, b"]]>")
+        } else if rest.starts_with(b"?") {
+            find(open + 1, b"?>")
+        } else {
+            let declaration = rest.starts_with(b"!");
+            let closing = rest.starts_with(b"/");
+            let mut quote = None;
+            let mut end = None;
+            for (offset, &byte) in rest
+                .iter()
+                .enumerate()
+            {
+                match quote {
+                    Some(q) if byte == q => quote = None,
+                    Some(_) => {}
+                    None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                    None if byte == b'[' && declaration => {
+                        anyhow::bail!("SVG has a document type with declarations")
+                    }
+                    None if byte == b'>' => {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if closing {
+                depth = depth.saturating_sub(1);
+            } else if !declaration {
+                // An empty element is a level too, though nothing nests in
+                // it.
+                anyhow::ensure!(depth < limit, "SVG nests too deep");
+                if !end.is_some_and(|end| bytes[end - 2] == b'/') {
+                    depth += 1;
+                }
+            }
+            end
+        };
+        let Some(end) = end else {
+            break;
+        };
+        at = end;
+    }
+    Ok(())
+}
+
+fn is_clip(node: roxmltree::Node) -> bool {
+    node.has_tag_name("clipPath")
+}
+
+/// Whether an attribute of `node` refers to another element by `url(...)`.
+fn refers(node: roxmltree::Node) -> bool {
+    node.attributes()
+        .any(|a| {
+            a.value()
+                .contains("url(")
+        })
+}
+
+/// The id an `href` value names in this document, read as the renderer reads
+/// it: after any spaces and the `#`, up to the next space.
+fn href_id(href: &str) -> Option<&str> {
+    let id = href
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .strip_prefix('#')?;
+    id.split(' ')
+        .next()
+}
+
+fn mentions(text: &str, word: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(word)
+}
+
+/// Whether a `stroke-dasharray` value asks for no dashes.
+fn no_dashes(value: &str) -> bool {
+    value.trim() == "none"
+}
+
+/// Whether style text sets a dash pattern other than `none`.
+fn sets_dashes(style: &str) -> bool {
+    // Lower case keeps every byte where it was, so a place found in one is
+    // the same place in the other.
+    style
+        .to_ascii_lowercase()
+        .match_indices("stroke-dasharray")
+        .any(|(at, word)| {
+            let value = style[at + word.len()..]
+                .split([';', '}'])
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .trim_start_matches(':');
+            !no_dashes(value)
+        })
+}
+
+/// Pixel size of a `width`×`height` image scaled to fit inside the box.
+fn fit_inside(width: f32, height: f32, box_w: u32, box_h: u32) -> (u32, u32) {
+    let scale = (box_w as f32 / width).min(box_h as f32 / height);
+    let side = |v: f32| ((v * scale).round() as u32).clamp(1, SVG_MAX_SIDE);
+    (side(width), side(height))
+}
+
+/// Rasterize an SVG as a PNG with its transparency, fitted inside
+/// `SVG_MAX_SIDE` each way, if `check_svg` accepts it.
+fn render_svg_png(svg: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // Read as text, so compressed SVG is refused rather than inflated.
+    let text = std::str::from_utf8(svg)?;
+    let doc = check_svg(text)?;
+    draw_svg(&doc)
+}
+
+/// Draw a checked SVG. No `<image>` reference is followed even so, so an SVG
+/// cannot make the server read a file or load another document. Errors when
+/// its layers would take more canvas than `SVG_MAX_LAYER_CANVASES`, and when
+/// nothing at all was drawn, rather than serve an empty PNG.
+fn draw_svg(doc: &roxmltree::Document) -> anyhow::Result<Vec<u8>> {
+    use resvg::{tiny_skia, usvg};
+
+    let mut options = usvg::Options::default();
+    options.image_href_resolver = usvg::ImageHrefResolver {
+        resolve_data: Box::new(|_, _, _| None),
+        resolve_string: Box::new(|_, _| None),
+    };
+    let tree = usvg::Tree::from_xmltree(doc, &options)?;
+    let size = tree.size();
+    let (width, height) =
+        fit_inside(size.width(), size.height(), SVG_MAX_SIDE, SVG_MAX_SIDE);
+    let scale_x = width as f32 / size.width();
+    let scale_y = height as f32 / size.height();
+    svg_layers_within(
+        tree.root(),
+        (f64::from(scale_x), f64::from(scale_y)),
+        SVG_MAX_LAYER_CANVASES * f64::from(width) * f64::from(height),
+    )?;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| anyhow::anyhow!("no {width}x{height} canvas"))?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale_x, scale_y),
+        &mut pixmap.as_mut(),
+    );
+
+    anyhow::ensure!(
+        pixmap
+            .pixels()
+            .iter()
+            .any(|px| px.alpha() > 0),
+        "SVG drew nothing"
+    );
+    // The canvas holds premultiplied alpha; PNG stores it straight.
+    let rgba = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|px| {
+            let c = px.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    let img = RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| anyhow::anyhow!("canvas is not {width}x{height}"))?;
+    let mut buf = Cursor::new(Vec::new());
+    img.write_to(&mut buf, ImageFormat::Png)?;
+    Ok(buf.into_inner())
+}
+
+/// Errors when the layers a render would draw add up to more than `budget`
+/// pixels. The renderer draws a group with opacity or a clip path on a layer
+/// the size of what the group holds, however far that reaches past the
+/// output, and a clipped layer takes a second canvas and a mask for its clip
+/// path. `scale` is the output pixels to one unit of the SVG, each way.
+fn svg_layers_within(
+    root: &resvg::usvg::Group,
+    scale: (f64, f64),
+    budget: f64,
+) -> anyhow::Result<()> {
+    let mut layers = 0.0;
+    // Walked with a list of groups still to visit, not by recursion.
+    let mut pending = vec![(root, false)];
+    while let Some((group, in_clip)) = pending.pop() {
+        if group.should_isolate() {
+            // Its size there is not in the output's units, and it is drawn
+            // for each element the clip path clips.
+            anyhow::ensure!(!in_clip, "SVG has a layer inside a clip path");
+            let bounds = group.abs_layer_bounding_box();
+            // The renderer adds two pixels on each side.
+            let across = (f64::from(bounds.width()) * scale.0).ceil() + 4.0;
+            let down = (f64::from(bounds.height()) * scale.1).ceil() + 4.0;
+            let clipped = group
+                .clip_path()
+                .is_some();
+            // A clipped layer also takes a canvas for its clip path and a
+            // mask.
+            let canvases = if clipped { 3.0 } else { 1.0 };
+            layers += canvases * across * down;
+            anyhow::ensure!(layers <= budget, "SVG draws too many layers");
+        }
+        let mut clip = group.clip_path();
+        while let Some(clipped_by) = clip {
+            pending.push((clipped_by.root(), true));
+            clip = clipped_by.clip_path();
+        }
+        for child in group.children() {
+            if let resvg::usvg::Node::Group(child) = child {
+                pending.push((&**child, in_clip));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resize `img` according to sizing params (fill → exact → max priority order).
 fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
     let orig_w = img.width();
@@ -2103,5 +2851,697 @@ mod tests {
         .unwrap();
 
         assert_ne!(first_key, second_key);
+    }
+
+    /// Half filled, half transparent, twice as wide as it is tall.
+    const HALF_FILLED_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="100" height="100" fill="#ff0000"/></svg>"##;
+
+    const SVG_OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">"#;
+
+    fn cached_pngs(data_dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(ImageService::cache_dir(data_dir))
+            .map(|dir| {
+                dir.map(|e| {
+                    e.unwrap()
+                        .path()
+                })
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|e| e == "png")
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn svg_png(data_dir: &std::path::Path, svg: &str) -> Vec<u8> {
+        ImageService::svg_as_png(data_dir, svg.as_bytes())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Clients that cannot draw SVG showed no logo when a provider sent one.
+    #[tokio::test]
+    async fn an_svg_is_rendered_as_a_transparent_png_fitted_to_the_size_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let png = svg_png(data_dir.path(), HALF_FILLED_SVG).await;
+
+        assert_eq!(detect_content_type(&png), "image/png");
+        let img = image::load_from_memory(&png)
+            .unwrap()
+            .into_rgba8();
+        // The 2:1 shape is kept, never cropped, and fills the size limit.
+        assert_eq!(img.dimensions(), (SVG_MAX_SIDE, SVG_MAX_SIDE / 2));
+        assert_eq!(*img.get_pixel(40, 320), Rgba([255, 0, 0, 255]));
+        assert_eq!(
+            img.get_pixel(1240, 320)[3],
+            0,
+            "the empty half stays transparent"
+        );
+    }
+
+    /// The size an SVG declares cannot make the server allocate a huge
+    /// canvas.
+    #[tokio::test]
+    async fn an_svg_render_never_exceeds_the_size_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1000000" height="500000"><rect width="1000000" height="500000"/></svg>"#;
+
+        let png = svg_png(data_dir.path(), svg).await;
+
+        let img = image::load_from_memory(&png).unwrap();
+        assert_eq!(
+            (img.width(), img.height()),
+            (SVG_MAX_SIDE, SVG_MAX_SIDE / 2)
+        );
+    }
+
+    /// A refused SVG is remembered, so it is not parsed and reported again on
+    /// every request.
+    #[tokio::test]
+    async fn an_oversized_or_malformed_svg_is_refused_once() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let oversized = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><!--{}--></svg>",
+            " ".repeat(SVG_MAX_BYTES)
+        );
+
+        for svg in [
+            oversized.as_str(),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>",
+        ] {
+            assert!(
+                ImageService::svg_as_png(data_dir.path(), svg.as_bytes())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                ImageService::svg_as_png(data_dir.path(), svg.as_bytes())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(cached_pngs(data_dir.path()).is_empty());
+    }
+
+    /// What a logo editor writes passes the check: styles, gradients, a clip
+    /// path and reused shapes.
+    #[test]
+    fn an_ordinary_logo_passes_the_check() {
+        check_svg(HALF_FILLED_SVG).unwrap();
+        check_svg(&format!(
+            "<?xml version=\"1.0\"?><!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x.dtd\">{HALF_FILLED_SVG}"
+        ))
+        .unwrap();
+        check_svg(&format!(
+            r##"{SVG_OPEN}<defs><style>.a{{fill:url(#g);}}</style><linearGradient id="g"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient><clipPath id="c"><rect width="10" height="10"/></clipPath><path id="p" d="M0 0h5v5H0z"/></defs><g clip-path="url(#c)"><use xlink:href="#p" class="a"/><use href="#p" x="5"/></g></svg>"##
+        ))
+        .unwrap();
+
+        // What an editor leaves in also passes, and is drawn: namespaces of
+        // its own, both forms of one reference, a gradient that takes its
+        // stops from another by way of a third, and a stroke said to have no
+        // dashes.
+        let exported = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="10" height="10"><defs><linearGradient id="a"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient><linearGradient id="b" xlink:href="#a"/><linearGradient id="c" xlink:href="#b" x2="0" y2="1"/><path id="p" d="M0 0h5v5H0z"/></defs><use href="#p" xlink:href="#p" fill="url(#c)" style="stroke-dasharray:none"/></svg>"##;
+        let doc = check_svg(exported).unwrap();
+        draw_svg(&doc).unwrap();
+    }
+
+    /// The nesting count sees the same levels as the XML parser, so ordinary
+    /// markup and nesting right at the limit still pass the check.
+    #[test]
+    fn the_depth_count_reads_markup_as_xml_does() {
+        // Empty elements, closing tags, quoted '>' and a plain document type
+        // leave the count where the parser has it.
+        let flat = format!(
+            "<?xml version=\"1.0\"?><!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">{SVG_OPEN}<!-- <g><g><g> -->{}</svg>",
+            "<g class='a>b'><rect width=\"1\" height=\"1\"/><path d=\"M0 0\" /></g>"
+                .repeat(500)
+        );
+        assert!(svg_depth_within(&flat, 3).is_ok());
+        assert!(svg_depth_within(&flat, 2).is_err());
+        check_svg(&flat).unwrap();
+
+        // An empty element is a level like any other.
+        let at_limit = format!(
+            "{SVG_OPEN}{}<rect width=\"1\" height=\"1\"/>{}</svg>",
+            "<g>".repeat(SVG_MAX_DEPTH - 2),
+            "</g>".repeat(SVG_MAX_DEPTH - 2)
+        );
+        check_svg(&at_limit).unwrap();
+        let over_limit = format!(
+            "{SVG_OPEN}{}<rect width=\"1\" height=\"1\"/>{}</svg>",
+            "<g>".repeat(SVG_MAX_DEPTH - 1),
+            "</g>".repeat(SVG_MAX_DEPTH - 1)
+        );
+        assert!(check_svg(&over_limit).is_err());
+        // The same groups with no leaf are exactly at the limit.
+        let groups_only = format!(
+            "{SVG_OPEN}{}{}</svg>",
+            "<g>".repeat(SVG_MAX_DEPTH - 1),
+            "</g>".repeat(SVG_MAX_DEPTH - 1)
+        );
+        check_svg(&groups_only).unwrap();
+
+        // Markup that only looks like a way back up a level is not counted
+        // as one.
+        for level in [
+            "<g><!--</g>-->",
+            "<g><![CDATA[</g>]]>",
+            "<g><?a </g>?>",
+            "<g>a/>",
+            "<g id=\"/>\">",
+        ] {
+            let deep = level.repeat(SVG_MAX_DEPTH + 1);
+            assert!(
+                svg_depth_within(&deep, SVG_MAX_DEPTH + 1).is_ok(),
+                "{level}"
+            );
+            assert!(svg_depth_within(&deep, SVG_MAX_DEPTH).is_err(), "{level}");
+        }
+
+        // Text cut off inside a tag is left to the parser to refuse.
+        assert!(svg_depth_within("<svg><g", 5).is_ok());
+        assert!(check_svg("<svg xmlns=\"http://www.w3.org/2000/svg\"><g").is_err());
+    }
+
+    /// An SVG is untrusted input: one whose parse or render cost is not
+    /// bounded by its size, or that would lose parts in the PNG, is refused
+    /// before it is parsed for drawing, each for its own reason.
+    #[test]
+    fn a_hostile_or_lossy_svg_is_refused_by_the_check() {
+        let nested = |levels: usize| {
+            format!(
+                "{SVG_OPEN}{}<rect width=\"1\" height=\"1\"/>{}</svg>",
+                "<g>".repeat(levels),
+                "</g>".repeat(levels)
+            )
+        };
+
+        let mut use_chain =
+            format!("{SVG_OPEN}<defs><rect id=\"a0\" width=\"1\" height=\"1\"/>");
+        for level in 1..8 {
+            use_chain += &format!("<g id=\"a{level}\">");
+            for _ in 0..10 {
+                use_chain += &format!("<use xlink:href=\"#a{}\"/>", level - 1);
+            }
+            use_chain += "</g>";
+        }
+        use_chain += "</defs><use href=\"#a7\"/></svg>";
+
+        let use_fan_out = format!(
+            "{SVG_OPEN}<defs><g id=\"a\">{}</g></defs>{}</svg>",
+            "<rect width=\"1\" height=\"1\"/>".repeat(2_000),
+            "<use href=\"#a\"/>".repeat(10)
+        );
+
+        let mut entities =
+            String::from("<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY e0 \"lol\">");
+        for level in 1..10 {
+            entities += &format!(
+                "<!ENTITY e{level} \"{}\">",
+                format!("&e{};", level - 1).repeat(10)
+            );
+        }
+        entities += &format!("]>{SVG_OPEN}<desc>&e9;</desc></svg>");
+
+        // One more gradient in a row than may take from the next.
+        let long_chain = (0..=SVG_MAX_HREF_HOPS)
+            .map(|n| format!("<linearGradient id=\"g{n}\" href=\"#g{}\"/>", n + 1))
+            .collect::<String>();
+        let last_in_chain = SVG_MAX_HREF_HOPS + 1;
+        // A group, and a group that holds a `<use>` of it.
+        let holder = "<g id=\"r\"/><g id=\"g\"><use href=\"#r\"/></g>";
+
+        let cases = [
+            ("deep nesting", "nests too deep", nested(1_000)),
+            // The XML parser would overflow the stack on this, so it also
+            // holds the depth count in front of the parser.
+            (
+                "nesting as deep as the size limit allows",
+                "nests too deep",
+                format!(
+                    "{SVG_OPEN}{}",
+                    "<g>".repeat((SVG_MAX_BYTES - SVG_OPEN.len()) / 3)
+                ),
+            ),
+            ("an entity bomb", "document type with declarations", entities),
+            (
+                "a document type with declarations",
+                "document type with declarations",
+                format!(
+                    "<!DOCTYPE svg [<!ELEMENT svg ANY>]>{SVG_OPEN}<rect width=\"1\" height=\"1\"/></svg>"
+                ),
+            ),
+            (
+                "inherited namespaces",
+                "too many namespaces",
+                format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\"{}>{}</svg>",
+                    (0..300)
+                        .map(|n| format!(" xmlns:p{n}=\"\""))
+                        .collect::<String>(),
+                    "<a xmlns:b=\"\"/>".repeat(300)
+                ),
+            ),
+            (
+                "not an SVG",
+                "not an SVG document",
+                "<html xmlns=\"http://www.w3.org/1999/xhtml\"/>".to_string(),
+            ),
+            (
+                "a filter",
+                "<filter>",
+                format!(
+                    "{SVG_OPEN}<filter id=\"f\"><feGaussianBlur stdDeviation=\"5\"/></filter><rect width=\"9\" height=\"9\" filter=\"url(#f)\"/></svg>"
+                ),
+            ),
+            (
+                "a filter function",
+                "has a filter",
+                format!(
+                    "{SVG_OPEN}<rect width=\"9\" height=\"9\" style=\"filter: blur(5px)\"/></svg>"
+                ),
+            ),
+            (
+                "a filter in another namespace",
+                "has a filter",
+                format!(
+                    "{SVG_OPEN}<rect width=\"9\" height=\"9\" xml:filter=\"blur(5)\"/></svg>"
+                ),
+            ),
+            (
+                "text",
+                "<text>",
+                format!(
+                    "{SVG_OPEN}<rect width=\"9\" height=\"2\"/><text y=\"8\">Made up</text></svg>"
+                ),
+            ),
+            (
+                "an embedded image",
+                "<image>",
+                format!(
+                    "{SVG_OPEN}<image width=\"9\" height=\"9\" href=\"data:image/png;base64,AAAA\"/></svg>"
+                ),
+            ),
+            (
+                "a pattern with a huge tile",
+                "<pattern>",
+                format!(
+                    "{SVG_OPEN}<pattern id=\"p\" patternUnits=\"userSpaceOnUse\" width=\"100000000\" height=\"100000000\"><rect width=\"9\" height=\"9\"/></pattern><rect width=\"9\" height=\"9\" fill=\"url(#p)\"/></svg>"
+                ),
+            ),
+            (
+                "a pattern that fills itself from the element round it",
+                "<pattern>",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\" fill=\"url(#p)\"><pattern id=\"p\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\"/></pattern><rect width=\"10\" height=\"10\"/></svg>".to_string(),
+            ),
+            (
+                "a pattern that fills itself from a style sheet",
+                "<pattern>",
+                format!(
+                    "{SVG_OPEN}<style>svg{{fill:url(#p)}}</style><pattern id=\"p\" width=\"1\" height=\"1\"><rect width=\"1\" height=\"1\"/></pattern><rect width=\"10\" height=\"10\"/></svg>"
+                ),
+            ),
+            (
+                "a dashed stroke",
+                "dashed stroke",
+                format!(
+                    "{SVG_OPEN}<path d=\"M0 0h9\" stroke=\"red\" stroke-dasharray=\"1\"/></svg>"
+                ),
+            ),
+            (
+                "a dashed stroke in another namespace",
+                "dashed stroke",
+                format!(
+                    "{SVG_OPEN}<path d=\"M0 0h9\" stroke=\"red\" xml:stroke-dasharray=\"1\"/></svg>"
+                ),
+            ),
+            (
+                "a dashed stroke in a style attribute",
+                "dashed stroke",
+                format!(
+                    "{SVG_OPEN}<path d=\"M0 0h9\" stroke=\"red\" style=\"stroke-dasharray: 1 2\"/></svg>"
+                ),
+            ),
+            (
+                "a dashed stroke in a style sheet",
+                "dashed stroke",
+                format!(
+                    "{SVG_OPEN}<style>path{{stroke-dasharray:1}}</style><path d=\"M0 0h9\" stroke=\"red\"/></svg>"
+                ),
+            ),
+            (
+                "a long style sheet",
+                "too much style text",
+                format!(
+                    "{SVG_OPEN}<style>{}</style></svg>",
+                    ".a{}".repeat(SVG_MAX_STYLE_BYTES / 4 + 1)
+                ),
+            ),
+            (
+                "a style sheet over deep nesting",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>g g g g g g rect{{fill:red}}</style>{}<rect width=\"1\" height=\"1\"/>{}</svg>",
+                    "<g>".repeat(SVG_MAX_STYLED_DEPTH),
+                    "</g>".repeat(SVG_MAX_STYLED_DEPTH)
+                ),
+            ),
+            (
+                "a style sheet over many elements",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>{}</style>{}</svg>",
+                    ".a{}".repeat(250),
+                    "<rect width=\"1\" height=\"1\"/>".repeat(1_000)
+                ),
+            ),
+            (
+                "a style sheet matched against what each <use> copies",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>{}</style><g id=\"t\">{}</g>{}</svg>",
+                    ".a{}".repeat(250),
+                    "<rect width=\"1\" height=\"1\"/>".repeat(30),
+                    "<use href=\"#t\"/>".repeat(40)
+                ),
+            ),
+            (
+                "a style sheet that reads an attribute by name",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>[d~=z]{{fill:red}}</style><path d=\"M0 0h9v9z\"/></svg>"
+                ),
+            ),
+            (
+                "a style sheet over a long class value",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>.z{{fill:red}}</style><rect class=\"{}\" width=\"1\" height=\"1\"/></svg>",
+                    "y ".repeat(SVG_MAX_CLASS_BYTES)
+                ),
+            ),
+            (
+                "a style sheet whose rules each copy a long block",
+                "too much to match",
+                format!(
+                    "{SVG_OPEN}<style>{}a{{{}}}</style><rect width=\"1\" height=\"1\"/></svg>",
+                    "a,".repeat(200),
+                    "x:1;".repeat(200)
+                ),
+            ),
+            (
+                "a gradient with many stops",
+                "too many stops",
+                format!(
+                    "{SVG_OPEN}<linearGradient id=\"g\">{}</linearGradient></svg>",
+                    "<stop offset=\"0\"/>".repeat(SVG_MAX_STOPS + 1)
+                ),
+            ),
+            (
+                "a chain of clip paths",
+                "chains clip paths",
+                format!(
+                    "{SVG_OPEN}<clipPath id=\"a\" clip-path=\"url(#b)\"><rect width=\"9\" height=\"9\"/></clipPath><clipPath id=\"b\"><rect width=\"5\" height=\"5\"/></clipPath><rect width=\"9\" height=\"9\" clip-path=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "a clip path that inherits a clip path",
+                "chains clip paths",
+                format!(
+                    "{SVG_OPEN}<g clip-path=\"url(#b)\"><clipPath id=\"a\" clip-path=\"inherit\"><rect width=\"9\" height=\"9\"/></clipPath></g><clipPath id=\"b\"><rect width=\"5\" height=\"5\"/></clipPath><rect width=\"9\" height=\"9\" clip-path=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "clip paths that reach each other through uses",
+                "<use> in a clip path",
+                format!(
+                    "{SVG_OPEN}<rect id=\"x\" width=\"9\" height=\"9\" clip-path=\"url(#b)\"/><rect id=\"y\" width=\"9\" height=\"9\" clip-path=\"url(#c)\"/><rect id=\"z\" width=\"9\" height=\"9\" clip-path=\"url(#a)\"/><clipPath id=\"a\"><use href=\"#x\"/></clipPath><clipPath id=\"b\"><use href=\"#y\"/></clipPath><clipPath id=\"c\"><use href=\"#z\"/></clipPath></svg>"
+                ),
+            ),
+            (
+                "clip paths that reach each other through a style sheet",
+                "clip path from a style sheet",
+                format!(
+                    "{SVG_OPEN}<style>.p{{clip-path:url(#b)}}.q{{clip-path:url(#a)}}</style><clipPath id=\"a\" class=\"p\"><rect width=\"9\" height=\"9\"/></clipPath><clipPath id=\"b\" class=\"q\"><rect width=\"9\" height=\"9\"/></clipPath><rect width=\"9\" height=\"9\" clip-path=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "a clip path sized by its target",
+                "sized by its target",
+                format!(
+                    "{SVG_OPEN}<clipPath id=\"c\" clipPathUnits=\"objectBoundingBox\"><rect width=\"1\" height=\"1\"/></clipPath></svg>"
+                ),
+            ),
+            (
+                "a clip path sized by its target, in another namespace",
+                "sized by its target",
+                format!(
+                    "{SVG_OPEN}<clipPath id=\"c\" xlink:clipPathUnits=\"objectBoundingBox\"><rect width=\"1\" height=\"1\"/></clipPath></svg>"
+                ),
+            ),
+            (
+                "a clip path that holds a lot",
+                "too much in its clip paths",
+                format!(
+                    "{SVG_OPEN}<clipPath id=\"c\">{}</clipPath></svg>",
+                    "<rect width=\"1\" height=\"1\"/>".repeat(SVG_MAX_CLIP_ELEMENTS + 1)
+                ),
+            ),
+            (
+                "gradients that refer to each other in a loop",
+                "in a loop or too far",
+                format!(
+                    "{SVG_OPEN}<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#c\"/><linearGradient id=\"c\" href=\"#b\"/><rect width=\"10\" height=\"10\" fill=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "a loop of gradients with ids in another namespace",
+                "in a loop or too far",
+                format!(
+                    "{SVG_OPEN}<linearGradient id=\"a\" href=\"#b\"/><linearGradient xml:id=\"b\" href=\"#c\"/><linearGradient xml:id=\"c\" href=\"#b\"/><rect width=\"10\" height=\"10\" fill=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "a gradient with stops that leads into a loop",
+                "in a loop or too far",
+                format!(
+                    "{SVG_OPEN}<linearGradient id=\"a\" href=\"#b\"><stop offset=\"0\"/><stop offset=\"1\"/></linearGradient><linearGradient id=\"b\" href=\"#c\"/><linearGradient id=\"c\" href=\"#b\"/><rect width=\"10\" height=\"10\" fill=\"url(#a)\"/></svg>"
+                ),
+            ),
+            (
+                "a long chain of gradients",
+                "in a loop or too far",
+                format!(
+                    "{SVG_OPEN}{long_chain}<linearGradient id=\"g{last_in_chain}\"><stop offset=\"0\"/></linearGradient></svg>"
+                ),
+            ),
+            ("a chain of uses", "<use> inside a <use>", use_chain),
+            ("a fan of uses", "too many elements", use_fan_out),
+            (
+                "a long path used again and again",
+                "too large once each <use> is expanded",
+                format!(
+                    "{SVG_OPEN}<path id=\"p\" d=\"M0 0{}\"/>{}</svg>",
+                    "h1v1".repeat(25_000),
+                    "<use href=\"#p\"/>".repeat(2)
+                ),
+            ),
+            (
+                "a use with two targets",
+                "<use> with two targets",
+                format!(
+                    "{SVG_OPEN}<defs>{holder}</defs><use href=\"#r\" xlink:href=\"#g\"/></svg>"
+                ),
+            ),
+            (
+                "two elements with one id",
+                "two elements with one id",
+                format!(
+                    "{SVG_OPEN}<defs>{holder}<rect id=\"g\" width=\"1\" height=\"1\"/></defs><use href=\"#g\"/></svg>"
+                ),
+            ),
+            (
+                "a use with a space before its reference",
+                "cannot be followed",
+                format!("{SVG_OPEN}<defs>{holder}</defs><use href=\" #g\"/></svg>"),
+            ),
+            (
+                "a use with a space after its reference",
+                "cannot be followed",
+                format!("{SVG_OPEN}<defs>{holder}</defs><use href=\"#g \"/></svg>"),
+            ),
+            (
+                "a use of an id that ends in a space",
+                "cannot be followed",
+                format!(
+                    "{SVG_OPEN}<defs>{holder}<rect id=\"g \" width=\"1\" height=\"1\"/></defs><use href=\"#g \"/></svg>"
+                ),
+            ),
+        ];
+        for (what, why, svg) in cases {
+            let refused = check_svg(&svg)
+                .expect_err(what)
+                .to_string();
+            assert!(refused.contains(why), "{what} was refused as: {refused}");
+        }
+    }
+
+    /// A group with opacity or a clip path is drawn on a layer of its own,
+    /// as large as what it holds: an SVG whose layers add up to far more
+    /// canvas than its picture is refused before any is made.
+    #[test]
+    fn an_svg_with_too_much_layer_is_refused_before_it_is_drawn() {
+        let reaching = format!(
+            "{SVG_OPEN}<rect x=\"-9999\" y=\"-9999\" width=\"99999\" height=\"99999\" opacity=\"0.5\"/></svg>"
+        );
+        let stacked = format!(
+            "{SVG_OPEN}{}<rect width=\"10\" height=\"10\"/>{}</svg>",
+            "<g opacity=\"0.9\">".repeat(20),
+            "</g>".repeat(20)
+        );
+        for svg in [reaching, stacked] {
+            let doc = check_svg(&svg).unwrap();
+            let refused = draw_svg(&doc)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("too many layers"), "{refused}");
+        }
+
+        // A few layers the size of the picture are what logos have.
+        let ordinary = format!(
+            "{SVG_OPEN}<clipPath id=\"c\"><rect width=\"10\" height=\"5\"/></clipPath><g clip-path=\"url(#c)\" opacity=\"0.5\"><rect width=\"10\" height=\"10\" opacity=\"0.5\"/></g></svg>"
+        );
+        let doc = check_svg(&ordinary).unwrap();
+        draw_svg(&doc).unwrap();
+    }
+
+    /// Even an SVG that got past the check cannot make the server read a local
+    /// file or decode another document it carries.
+    #[test]
+    fn an_svg_cannot_make_the_server_read_a_file_or_load_a_document() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let inner = source_dir
+            .path()
+            .join("inner.svg");
+        std::fs::write(
+            &inner,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#,
+        )
+        .unwrap();
+        // The same document as a data URI.
+        let inner_data = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIi8+PC9zdmc+";
+        // The top half is drawn; the bottom half could only come from the
+        // referenced documents.
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="10" fill="#0000ff"/><image x="0" y="10" width="10" height="10" href="{}"/><image x="10" y="10" width="10" height="10" href="{inner_data}"/></svg>"##,
+            inner.display(),
+        );
+
+        // Drawn without the check, which would refuse the `<image>`.
+        let doc = roxmltree::Document::parse(&svg).unwrap();
+        let png = draw_svg(&doc).unwrap();
+
+        let img = image::load_from_memory(&png)
+            .unwrap()
+            .into_rgba8();
+        let (w, h) = img.dimensions();
+        assert_eq!(img.get_pixel(w / 2, h / 4)[3], 255);
+        assert_eq!(
+            img.get_pixel(w / 4, h * 3 / 4)[3],
+            0,
+            "the file was not drawn"
+        );
+        assert_eq!(
+            img.get_pixel(w * 3 / 4, h * 3 / 4)[3],
+            0,
+            "the data URI was not drawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_request_for_an_svg_is_served_from_the_cache() {
+        let data_dir = tempfile::tempdir().unwrap();
+        svg_png(data_dir.path(), HALF_FILLED_SVG).await;
+        let cached = cached_pngs(data_dir.path());
+        assert_eq!(cached.len(), 1);
+        // Nothing is left of the temporary file it was written under.
+        let files = std::fs::read_dir(ImageService::cache_dir(data_dir.path()))
+            .unwrap()
+            .count();
+        assert_eq!(files, 1);
+
+        // Replacing the cached file proves the second call reads it rather
+        // than rendering again.
+        let mut marker = Cursor::new(Vec::new());
+        RgbaImage::new(3, 3)
+            .write_to(&mut marker, ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&cached[0], marker.get_ref()).unwrap();
+
+        let second = svg_png(data_dir.path(), HALF_FILLED_SVG).await;
+        assert_eq!(&second, marker.get_ref());
+    }
+
+    /// A request that waited for a render slot uses what the render before it
+    /// stored, instead of rendering the same SVG again.
+    #[tokio::test]
+    async fn a_request_that_waited_for_a_render_slot_reads_the_cache() {
+        let data_dir = tempfile::tempdir().unwrap();
+        svg_png(data_dir.path(), HALF_FILLED_SVG).await;
+        let cached = cached_pngs(data_dir.path());
+        std::fs::remove_file(&cached[0]).unwrap();
+
+        let slots = SVG_RENDERS
+            .acquire_many(SVG_MAX_RENDERS as u32)
+            .await
+            .unwrap();
+        let dir = data_dir
+            .path()
+            .to_path_buf();
+        let waiting = tokio::spawn(async move {
+            ImageService::svg_as_png(&dir, HALF_FILLED_SVG.as_bytes()).await
+        });
+        // Long enough for it to miss the cache and start waiting for a slot.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut marker = Cursor::new(Vec::new());
+        RgbaImage::new(3, 3)
+            .write_to(&mut marker, ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&cached[0], marker.get_ref()).unwrap();
+        drop(slots);
+
+        let png = waiting
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&png, marker.get_ref());
+    }
+
+    /// A cache file that cannot be put in place leaves nothing behind.
+    #[tokio::test]
+    async fn a_failed_cache_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder in the way: the file cannot be renamed onto it.
+        let path = dir
+            .path()
+            .join("taken.png");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(
+            ImageService::write_cache_file(&path, b"png")
+                .await
+                .is_err()
+        );
+        let left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .count();
+        assert_eq!(left, 1);
     }
 }

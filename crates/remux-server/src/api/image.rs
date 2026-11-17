@@ -74,6 +74,60 @@ pub fn detect_content_type(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// Whether `bytes` are an SVG document: an optional byte order mark, XML
+/// declaration, comments and doctype, then an `<svg>` root. Raster formats
+/// never start with `<`, so none is taken for SVG. Compressed SVG is not
+/// recognised, and only the first 4 KiB are looked at, so neither is an SVG
+/// whose prolog is longer.
+pub fn is_svg(bytes: &[u8]) -> bool {
+    let bytes = &bytes[..bytes
+        .len()
+        .min(4096)];
+    let mut rest = bytes
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(bytes);
+    loop {
+        rest = rest.trim_ascii_start();
+        if let Some(after) = rest.strip_prefix(b"<svg") {
+            return after
+                .first()
+                .is_some_and(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'));
+        }
+        let end: &[u8] = if rest.starts_with(b"<?") {
+            b"?>"
+        } else if rest.starts_with(b"<!--") {
+            b"-->"
+        } else if rest.starts_with(b"<!") {
+            // A doctype may carry an internal subset in brackets, with `>`
+            // inside it.
+            let close = rest
+                .iter()
+                .position(|&b| b == b'>');
+            if close.is_some_and(|c| rest[..c].contains(&b'[')) {
+                b"]"
+            } else {
+                b">"
+            }
+        } else {
+            return false;
+        };
+        let Some(at) = rest
+            .windows(end.len())
+            .position(|w| w == end)
+        else {
+            return false;
+        };
+        rest = &rest[at + end.len()..];
+        if end == b"]" {
+            rest = rest.trim_ascii_start();
+            let Some(after) = rest.strip_prefix(b">") else {
+                return false;
+            };
+            rest = after;
+        }
+    }
+}
+
 impl<S> FromRequest<S> for JellyfinImage
 where
     S: Send + Sync,
@@ -92,5 +146,42 @@ where
             bytes: Bytes::from(decoded),
             content_type,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_svg;
+
+    /// Item images are sniffed for SVG so they can be served as PNG; the
+    /// sniff must see through the prolog editors write and never match a
+    /// raster image or an HTML page.
+    #[test]
+    fn svg_is_recognised_after_its_prolog_and_nothing_else_is() {
+        assert!(is_svg(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"));
+        assert!(is_svg(b"\xEF\xBB\xBF\n  <svg>"));
+        assert!(is_svg(
+            b"<?xml version=\"1.0\"?>\n<!-- made by hand -->\n\
+              <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x.dtd\" [\n\
+              <!ENTITY ns \"made up\">\n]>\n<svg width=\"1\">"
+        ));
+
+        assert!(!is_svg(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_svg(&[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(!is_svg(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!is_svg(
+            b"<!DOCTYPE html><html><body><svg></svg></body></html>"
+        ));
+        assert!(!is_svg(b"<svgfoo/>"));
+        assert!(!is_svg(b"<?xml version=\"1.0\""));
+        assert!(!is_svg(b""));
+    }
+
+    /// The sniff runs on every image body: only the first 4 KiB are looked
+    /// at, so it costs the same on a body of any size.
+    #[test]
+    fn only_a_short_prefix_is_sniffed() {
+        assert!(is_svg(format!("{}<svg/>", " ".repeat(4000)).as_bytes()));
+        assert!(!is_svg(format!("{}<svg/>", " ".repeat(4096)).as_bytes()));
     }
 }
