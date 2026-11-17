@@ -3333,12 +3333,16 @@ impl MediaSourceInfo {
 /// best-effort parse of the release filename and must never count as a
 /// completed probe: it must not block a real ffprobe attempt or a RemuxDB
 /// lookup, and must never be used for playback/transcode decisions.
+/// `Container` is a measured length only, read from the file's own header as
+/// it was relayed; every other fact is what it was before (a filename guess,
+/// or nothing), so like `FilenameGuess` it is never a completed probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeOrigin {
     Ffprobe,
     RemuxDb,
     FilenameGuess,
+    Container,
 }
 
 #[dto]
@@ -3349,14 +3353,16 @@ pub struct MediaSourceRemuxInfo {
 
 impl MediaSourceInfo {
     /// True when this source's facts are a filename guess, not a completed
-    /// probe. Callers deciding whether to skip a real probe/RemuxDB lookup
-    /// must check this — `video_stream().is_some()` alone is not enough.
+    /// probe, also when only its length was since read from its header
+    /// (`ProbeOrigin::Container`). Callers deciding whether to skip a real
+    /// probe/RemuxDB lookup must check this — `video_stream().is_some()`
+    /// alone is not enough.
     pub fn is_filename_guess(&self) -> bool {
         matches!(
             self.remux
                 .as_ref()
                 .and_then(|r| r.source),
-            Some(ProbeOrigin::FilenameGuess)
+            Some(ProbeOrigin::FilenameGuess | ProbeOrigin::Container)
         )
     }
 

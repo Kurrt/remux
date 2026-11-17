@@ -29,6 +29,7 @@ pub mod sdks {
 mod addons;
 pub mod api;
 mod common;
+mod container_length;
 pub mod jellyfin_client;
 pub use common::stable_media_uuid;
 pub mod db;

@@ -103,6 +103,9 @@ pub const GRACE: Duration = Duration::from_secs(60);
 /// How long a play runs before its pass may start, so the player's first
 /// buffering has the source to itself.
 pub const START_DELAY: Duration = Duration::from_secs(15);
+/// How often, during the start delay, a version played with no measured
+/// length is looked at again for one read from its header as it plays.
+pub const LENGTH_CHECK: Duration = Duration::from_secs(2);
 /// How long after a failed pass the same file gets no new one.
 pub const FAILURE_WAIT: Duration = Duration::from_secs(10 * 60);
 /// How long another version that could not be read is not read again.
@@ -387,23 +390,89 @@ pub fn picture_count(ticks: i64) -> u64 {
         .div_ceil(interval_ticks as u64)
 }
 
-/// A stream's own measured length in ticks: probed here or taken from
-/// RemuxDB. A length guessed from the file name, or the title's listed
-/// runtime stored in its place, is not one.
+/// A stream's own measured length in ticks: probed here, taken from
+/// RemuxDB, or read from the file's header as it was relayed (see
+/// [`store_length`]). A length guessed from the file name, or the title's
+/// listed runtime stored in its place, is not one.
 pub fn measured_ticks(stream: &db::Media) -> Option<i64> {
-    let probe = stream
+    stream
         .probe_data
-        .as_ref()?;
+        .as_ref()
+        .and_then(probe_ticks)
+}
+
+fn probe_ticks(probe: &api::MediaSourceInfo) -> Option<i64> {
     let measured = matches!(
         probe
             .remux
             .as_ref()
             .and_then(|r| r.source),
-        Some(api::ProbeOrigin::Ffprobe | api::ProbeOrigin::RemuxDb)
+        Some(
+            api::ProbeOrigin::Ffprobe
+                | api::ProbeOrigin::RemuxDb
+                | api::ProbeOrigin::Container
+        )
     );
     probe
         .run_time_ticks
         .filter(|t| measured && *t > 0)
+}
+
+/// Whether the bytes relayed for `stream` are read for the length its file
+/// states: a stream row under a title with no measured length.
+pub fn wants_length(stream: &db::Media) -> bool {
+    stream.kind == db::MediaKind::Stream
+        && stream
+            .parent_id
+            .is_some()
+        && measured_ticks(stream).is_none()
+}
+
+/// `probe` with `ticks` as the length read from the file's header and every
+/// other fact kept, or `None` when it has a measured length already.
+fn with_length(
+    probe: Option<api::MediaSourceInfo>,
+    ticks: i64,
+) -> Option<api::MediaSourceInfo> {
+    let mut probe = probe.unwrap_or_default();
+    if probe_ticks(&probe).is_some() {
+        return None;
+    }
+    probe.run_time_ticks = Some(ticks);
+    probe
+        .remux
+        .get_or_insert_with(Default::default)
+        .source = Some(api::ProbeOrigin::Container);
+    Some(probe)
+}
+
+/// Stores the length a stream's file states, read from its header as it was
+/// relayed, once: a row measured meanwhile keeps its own (see
+/// [`db::Media::change_probe_data`]).
+pub async fn store_length(
+    ctx: AppContext,
+    stream_id: Uuid,
+    title: String,
+    ticks: i64,
+    container: &'static str,
+) {
+    match db::Media::change_probe_data(&ctx.db, &stream_id, |probe| {
+        with_length(probe, ticks)
+    })
+    .await
+    {
+        Ok(true) => debug!(
+            %stream_id,
+            %title,
+            seconds = ticks as f64 / TICKS_PER_SEC as f64,
+            container,
+            "trick play: a stream's length was read from its header"
+        ),
+        Ok(false) => {}
+        Err(error) => {
+            warn!(%stream_id, %error, "trick play: could not store a stream's length")
+        }
+    }
 }
 
 /// The set a stream's pictures belong to. Versions of one title share a set
@@ -2357,6 +2426,21 @@ async fn resolve_plan(
         .await
         .map_err(|_| Ineligible::NoStream)?,
     };
+    // An addon kept for seek previews only is asked only for a measured
+    // version, and the length of this one may be read from its header in the
+    // play's first seconds.
+    let passes = &ctx
+        .sessions
+        .trickplay;
+    let (stream, delay_spent) = if wants_length(&stream)
+        && has_preview_source(&passes.addon_rules())
+    {
+        passes
+            .wait_for_length(&play.play_session_id, stream, |id| stored_stream(ctx, id))
+            .await
+    } else {
+        (stream, Duration::ZERO)
+    };
     let info = stream
         .stream_info
         .as_ref()
@@ -2447,6 +2531,7 @@ async fn resolve_plan(
         preview,
         played_refused: None,
         other_lengths,
+        delay_spent,
     };
     if plan
         .preview
@@ -3035,6 +3120,10 @@ pub(crate) struct PassPlan {
     /// Streams that would have stood in but for their length (see
     /// [`other_lengths`]), for the log when nothing can be read.
     pub other_lengths: usize,
+    /// How much of the start delay was spent before the plan was settled,
+    /// waiting for the length of the version played (see
+    /// [`TrickplayPasses::wait_for_length`]).
+    pub delay_spent: Duration,
 }
 
 impl PassPlan {
@@ -3494,6 +3583,7 @@ async fn run_ffmpeg(job: PassJob, mut cancel: oneshot::Receiver<()>) -> RunResul
 struct Limits {
     grace: Duration,
     start_delay: Duration,
+    length_check: Duration,
     failure_wait: Duration,
     other_failure_wait: Duration,
     min_free_bytes: u64,
@@ -3515,6 +3605,7 @@ impl Default for Limits {
         Self {
             grace: GRACE,
             start_delay: START_DELAY,
+            length_check: LENGTH_CHECK,
             failure_wait: FAILURE_WAIT,
             other_failure_wait: OTHER_FAILURE_WAIT,
             min_free_bytes: MIN_FREE_BYTES,
@@ -4396,6 +4487,57 @@ impl TrickplayPasses {
             .any(|(id, pass)| *id != set_id && pass.waiting)
     }
 
+    /// The version played, looked at again every [`LENGTH_CHECK`] during the
+    /// start delay until it has a measured length: one read from its header
+    /// as the play's first bytes pass (see [`store_length`]). Returns it as
+    /// read last, at the end of the delay at the latest, or at once when the
+    /// play was released meanwhile, with the time it took: the plan keeps
+    /// that (see [`PassPlan::delay_spent`]), and it is taken off the start
+    /// delay [`Self::begin_with`] waits, so no wait runs past it. `look`
+    /// reads the row again by its id.
+    pub(crate) async fn wait_for_length<L, F>(
+        &self,
+        play_session_id: &str,
+        mut stream: db::Media,
+        look: L,
+    ) -> (db::Media, Duration)
+    where
+        L: Fn(Uuid) -> F,
+        F: Future<Output = Option<db::Media>>,
+    {
+        let limits = self
+            .inner
+            .limits;
+        let started = Instant::now();
+        while measured_ticks(&stream).is_none() {
+            let left = limits
+                .start_delay
+                .saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            tokio::time::sleep(
+                limits
+                    .length_check
+                    .min(left),
+            )
+            .await;
+            if self
+                .play_of(play_session_id)
+                .is_none()
+            {
+                break;
+            }
+            if let Some(read) = look(stream.id)
+                .await
+                .filter(|read| measured_ticks(read).is_some())
+            {
+                stream = read;
+            }
+        }
+        (stream, started.elapsed())
+    }
+
     /// [`Self::begin_with`] with a finder that finds nothing.
     #[cfg(test)]
     pub(crate) async fn begin<R, W>(
@@ -4454,10 +4596,12 @@ impl TrickplayPasses {
             // a stream's own set may run past a count guessed from its runtime.
             pass.pictures = (plan.set_id != plan.stream_id).then_some(plan.pictures);
         }
+        // Time spent waiting for the length of the version played counts.
         tokio::time::sleep(
             self.inner
                 .limits
-                .start_delay,
+                .start_delay
+                .saturating_sub(plan.delay_spent),
         )
         .await;
         let Some((device_id, item_id)) = self.play_of(play_session_id) else {
@@ -5701,6 +5845,7 @@ mod tests {
         Limits {
             grace: Duration::from_millis(50),
             start_delay: Duration::from_millis(10),
+            length_check: Duration::from_millis(5),
             failure_wait: FAILURE_WAIT,
             other_failure_wait: OTHER_FAILURE_WAIT,
             min_free_bytes: 0,
@@ -5744,6 +5889,7 @@ mod tests {
             preview: None,
             played_refused: None,
             other_lengths: 0,
+            delay_spent: Duration::ZERO,
         }
     }
 
@@ -13339,6 +13485,447 @@ mod tests {
             failed(Instant::now() + OTHER_FAILURE_WAIT + Duration::from_secs(1)),
             0,
             "measured again after its wait"
+        );
+    }
+
+    // A length read from the header of the version played as it plays.
+
+    /// A start delay long enough to see a length arrive part way through it.
+    const WAIT_DELAY: Duration = Duration::from_millis(1_500);
+    /// How much later than planned a test's timer may fire.
+    const SLACK: Duration = Duration::from_millis(250);
+
+    /// Passes whose snapshot holds `dedicated`, with [`WAIT_DELAY`].
+    fn waiting_passes(dedicated: &Addon) -> TrickplayPasses {
+        let passes = TrickplayPasses::with_limits(Limits {
+            start_delay: WAIT_DELAY,
+            length_check: Duration::from_millis(40),
+            ..fast()
+        });
+        passes.set_addon_rules(std::slice::from_ref(dedicated));
+        passes
+    }
+
+    /// A version of `title` stored with the title's listed runtime and no
+    /// measured length.
+    fn unmeasured(title: Uuid, addon_id: Uuid) -> db::Media {
+        let mut row = version(title, RUNTIME as f64, addon_id, 0);
+        if let Some(probe) = row
+            .probe_data
+            .as_mut()
+        {
+            probe.remux = Some(api::MediaSourceRemuxInfo {
+                provider_info: None,
+                source: Some(api::ProbeOrigin::FilenameGuess),
+            });
+        }
+        row
+    }
+
+    /// `row` with its length read from its header.
+    fn learned(row: &db::Media) -> db::Media {
+        db::Media {
+            probe_data: with_length(
+                row.probe_data
+                    .clone(),
+                RUNTIME as i64 * TICKS_PER_SEC,
+            ),
+            ..row.clone()
+        }
+    }
+
+    #[test]
+    fn a_length_from_the_header_counts_as_measured_and_keeps_the_rest() {
+        let title = Uuid::new_v4();
+        let row = unmeasured(title, Uuid::new_v4());
+        assert!(wants_length(&row));
+        assert_eq!(measured_ticks(&row), None);
+        let tracks = vec![api::MediaStream {
+            type_: api::MediaStreamType::Video,
+            codec: Some("h264".to_string()),
+            ..Default::default()
+        }];
+        let guessed = api::MediaSourceInfo {
+            media_streams: tracks.clone(),
+            container: Some(api::VideoContainer::Mkv),
+            ..row
+                .probe_data
+                .clone()
+                .unwrap()
+        };
+        let ticks = 62_065_280_000;
+        let stored = with_length(Some(guessed), ticks).expect("stored");
+        assert_eq!(stored.run_time_ticks, Some(ticks));
+        assert_eq!(stored.media_streams, tracks);
+        assert_eq!(stored.container, Some(api::VideoContainer::Mkv));
+        assert!(stored.is_filename_guess(), "its tracks are still a guess");
+        let row = db::Media {
+            probe_data: Some(stored.clone()),
+            ..row
+        };
+        assert_eq!(measured_ticks(&row), Some(ticks));
+        assert!(!wants_length(&row));
+        assert!(set_id(&row) != row.id, "it shares a set by its count");
+
+        // A row with no probe data gets some; a measured one keeps its own.
+        let created = with_length(None, ticks).expect("created");
+        assert_eq!(created.run_time_ticks, Some(ticks));
+        assert!(
+            created
+                .media_streams
+                .is_empty()
+        );
+        assert!(with_length(Some(stored), ticks + 1).is_none());
+        let probed = version(title, 6_206.528, Uuid::new_v4(), 0);
+        assert!(with_length(probed.probe_data, ticks).is_none());
+        // Not a stream under a title.
+        let loose = db::Media {
+            parent_id: None,
+            ..unmeasured(title, Uuid::new_v4())
+        };
+        assert!(!wants_length(&loose));
+    }
+
+    #[tokio::test]
+    async fn a_length_read_during_the_start_delay_gets_the_play_its_ask_and_its_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = waiting_passes(&dedicated);
+        let playing = unmeasured(Uuid::new_v4(), addon("stremio", false).id);
+        let stored = Arc::new(Mutex::new(playing.clone()));
+        let arrives = stored.clone();
+        let measured_row = learned(&playing);
+        // At about 4 of 15 seconds.
+        let at = WAIT_DELAY * 4 / 15;
+        tokio::spawn(async move {
+            tokio::time::sleep(at).await;
+            *arrives
+                .lock()
+                .unwrap() = measured_row;
+        });
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let started = Instant::now();
+        let (got, spent) = passes
+            .wait_for_length("play-a", playing, |_id| {
+                let row = stored
+                    .lock()
+                    .unwrap()
+                    .clone();
+                std::future::ready(Some(row))
+            })
+            .await;
+        let waited = started.elapsed();
+        assert!(spent <= waited, "{spent:?}");
+        assert_eq!(measured_ticks(&got), Some(RUNTIME as i64 * TICKS_PER_SEC));
+        assert!(waited >= at, "{waited:?}");
+        assert!(
+            waited < at + SLACK,
+            "it stops once the length is there: {waited:?}"
+        );
+
+        let set = set_id(&got);
+        let ask =
+            preview_ask(&got, set, tmp.path(), Uuid::new_v4(), &passes.addon_rules())
+                .expect("asked as a measured version is");
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let plan = PassPlan {
+            preview: Some(ask),
+            delay_spent: spent,
+            ..plan_with(tmp.path(), set, &[])
+        };
+        let begun = passes
+            .begin_with("play-a", plan, runner.clone(), always(), &finder)
+            .await;
+        let delay = started.elapsed();
+        assert_eq!(begun, Begin::Queued);
+        assert!(delay + SLACK >= WAIT_DELAY, "{delay:?}");
+        assert!(
+            delay < WAIT_DELAY + SLACK,
+            "the wait is part of the start delay, not added to it: {delay:?}"
+        );
+        until(|| !passes.is_queued(set)).await;
+        assert_eq!(finder.calls(), 1);
+        assert_eq!(runner.inputs(), strings(&["preview-a"]));
+        assert!(is_done(&set_dir(tmp.path(), set)));
+    }
+
+    #[tokio::test]
+    async fn a_length_that_never_arrives_ends_the_wait_at_the_delay_with_no_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = waiting_passes(&dedicated);
+        let playing = unmeasured(Uuid::new_v4(), addon("stremio", false).id);
+        let looks = AtomicUsize::new(0);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let started = Instant::now();
+        let (got, spent) = passes
+            .wait_for_length("play-a", playing.clone(), |_id| {
+                looks.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Some(playing.clone()))
+            })
+            .await;
+        let waited = started.elapsed();
+        assert!(spent <= waited, "{spent:?}");
+        assert_eq!(measured_ticks(&got), None);
+        assert!(waited + SLACK >= WAIT_DELAY, "{waited:?}");
+        assert!(waited < WAIT_DELAY + SLACK, "{waited:?}");
+        assert!(looks.load(Ordering::SeqCst) > 1);
+        let set = set_id(&got);
+        assert_eq!(set, got.id);
+        assert!(
+            preview_ask(&got, set, tmp.path(), Uuid::new_v4(), &passes.addon_rules())
+                .is_none()
+        );
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let begun = passes
+            .begin_with(
+                "play-a",
+                PassPlan {
+                    delay_spent: spent,
+                    ..plan_with(tmp.path(), set, &[])
+                },
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        assert!(
+            started.elapsed() < WAIT_DELAY + SLACK,
+            "no second start delay"
+        );
+        until(|| !passes.is_queued(set)).await;
+        assert_eq!(finder.calls(), 0);
+        assert_eq!(runner.inputs(), strings(&[PLAYED]), "as today");
+    }
+
+    #[tokio::test]
+    async fn a_measured_version_is_not_kept_waiting() {
+        let dedicated = preview_addon();
+        let passes = waiting_passes(&dedicated);
+        let playing = version(Uuid::new_v4(), RUNTIME as f64, Uuid::new_v4(), 0);
+        assert!(!wants_length(&playing));
+        let looks = AtomicUsize::new(0);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let started = Instant::now();
+        let (got, spent) = passes
+            .wait_for_length("play-a", playing.clone(), |_id| {
+                looks.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(None)
+            })
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(40));
+        assert!(spent < Duration::from_millis(40));
+        assert_eq!(looks.load(Ordering::SeqCst), 0);
+        assert_eq!(got.id, playing.id);
+    }
+
+    #[tokio::test]
+    async fn a_play_that_goes_away_during_the_wait_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = waiting_passes(&dedicated);
+        let playing = unmeasured(Uuid::new_v4(), addon("stremio", false).id);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let leaving = passes.clone();
+        let at = WAIT_DELAY / 5;
+        tokio::spawn(async move {
+            tokio::time::sleep(at).await;
+            leaving.release("play-a");
+        });
+        let started = Instant::now();
+        let (got, _spent) = passes
+            .wait_for_length("play-a", playing.clone(), |_id| {
+                std::future::ready(Some(playing.clone()))
+            })
+            .await;
+        assert!(started.elapsed() < at + SLACK, "it stops with the play");
+        assert_eq!(passes.registration_count(), 0);
+        let finder = FakeFinder::default();
+        let runner = Arc::new(FakeRunner::default());
+        let set = set_id(&got);
+        let begun = passes
+            .begin_with(
+                "play-a",
+                plan_with(tmp.path(), set, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Released);
+        assert!(!passes.has_pass(set));
+        assert_eq!(passes.registration_count(), 0);
+        assert_eq!(finder.calls(), 0);
+        assert_eq!(
+            runner
+                .runs
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// A made-up film stored in `ctx`, with one version listed at the film's
+    /// runtime, its length measured or not.
+    async fn film_and_version(
+        ctx: &AppContext,
+        tmdb: i64,
+        measured: bool,
+    ) -> (db::Media, db::Media) {
+        let mut film = db::Media {
+            title: "Invented Film".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                ..Default::default()
+            },
+            runtime: Some(RUNTIME as i64),
+            ..Default::default()
+        };
+        film.save(&ctx.db)
+            .await
+            .unwrap();
+        let origin = if measured {
+            api::ProbeOrigin::Ffprobe
+        } else {
+            api::ProbeOrigin::FilenameGuess
+        };
+        let mut stream = db::Media {
+            title: "Invented.Film.1080p.mkv".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(film.id),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::http(URL),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                run_time_ticks: Some(RUNTIME as i64 * TICKS_PER_SEC),
+                remux: Some(api::MediaSourceRemuxInfo {
+                    provider_info: None,
+                    source: Some(origin),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        (film, stream)
+    }
+
+    fn play_of_version(film: &db::Media, stream: &db::Media) -> PlayStart {
+        PlayStart {
+            play_session_id: "play-a".to_string(),
+            item_id: film.id,
+            media_source_id: Some(stream.id),
+            device_id: "device-a".to_string(),
+            user_id: Uuid::new_v4(),
+        }
+    }
+
+    /// The plan of a play whose length is read from its header in its first
+    /// seconds waits for it, counts its pictures from it and asks the addon
+    /// kept for seek previews only, as for a measured version.
+    #[tokio::test]
+    async fn a_plan_waits_for_a_length_read_as_the_play_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = ctx_in(tmp.path()).await;
+        let ctx = &guard.0;
+        let passes = &ctx
+            .sessions
+            .trickplay;
+        passes.set_addon_rules(std::slice::from_ref(&preview_addon()));
+        let (film, stream) = film_and_version(ctx, 1, false).await;
+        passes.register("play-a", film.id, "device-a");
+        // 6,206.528 s: 621 pictures, where the listed runtime gives 720.
+        let ticks = 62_065_280_000;
+        let at = Duration::from_millis(300);
+        let storing = ctx.clone();
+        let stream_id = stream.id;
+        tokio::spawn(async move {
+            tokio::time::sleep(at).await;
+            store_length(
+                storing,
+                stream_id,
+                "Invented.Film.1080p.mkv".to_string(),
+                ticks,
+                "matroska",
+            )
+            .await;
+        });
+        let started = Instant::now();
+        let plan = resolve_plan(ctx, &play_of_version(&film, &stream))
+            .await
+            .expect("planned");
+        let took = started.elapsed();
+        assert!(
+            plan.preview
+                .is_some(),
+            "asked as a measured version is"
+        );
+        assert_eq!(plan.pictures, picture_count(ticks));
+        assert_ne!(plan.pictures, picture_count(RUNTIME as i64 * TICKS_PER_SEC));
+        assert!(plan.delay_spent >= at, "{:?}", plan.delay_spent);
+        assert!(plan.delay_spent <= took, "{:?}", plan.delay_spent);
+        assert!(took < START_DELAY, "{took:?}");
+    }
+
+    /// Only a version with no measured length, while an addon kept for seek
+    /// previews only is enabled, keeps its plan waiting.
+    #[tokio::test]
+    async fn a_plan_does_not_wait_when_the_length_is_known_or_not_wanted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = ctx_in(tmp.path()).await;
+        let ctx = &guard.0;
+        let passes = &ctx
+            .sessions
+            .trickplay;
+        let (film, unmeasured_row) = film_and_version(ctx, 1, false).await;
+        let (other_film, measured_row) = film_and_version(ctx, 2, true).await;
+
+        // No addon kept for seek previews only.
+        passes.set_addon_rules(&[]);
+        passes.register("play-a", film.id, "device-a");
+        let started = Instant::now();
+        let plan = resolve_plan(ctx, &play_of_version(&film, &unmeasured_row))
+            .await
+            .expect("planned");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(plan.delay_spent, Duration::ZERO);
+        assert!(
+            plan.preview
+                .is_none()
+        );
+        passes.release("play-a");
+
+        // A measured version, with one enabled.
+        passes.set_addon_rules(std::slice::from_ref(&preview_addon()));
+        passes.register("play-a", other_film.id, "device-a");
+        let started = Instant::now();
+        let plan = resolve_plan(ctx, &play_of_version(&other_film, &measured_row))
+            .await
+            .expect("planned");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(plan.delay_spent, Duration::ZERO);
+        assert!(
+            plan.preview
+                .is_some()
         );
     }
 }

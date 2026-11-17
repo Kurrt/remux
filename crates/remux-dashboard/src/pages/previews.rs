@@ -431,7 +431,7 @@ fn PreviewsAddonPanel() -> Element {
             p {
                 class: "field-hint",
                 style: "border-left:2px solid var(--info);padding-left:10px",
-                "A dedicated addon makes previews quicker. Give it \"seek previews\" on and \"stream\" off, and sort its results by quickest to load. Remux needs a file the same length as the one being played, so strict filters there mean fewer previews. It is asked in the background, after a play starts."
+                "A dedicated addon makes previews quicker. Give it \"seek previews\" on and \"stream\" off, and sort its results by quickest to load. Remux needs a file the same length as the one being played, so strict filters there mean fewer previews. The length of the file being played is read from its stream as it plays, so previews for a file can start a few seconds into its first play. It is asked in the background, after a play starts."
             }
             Notes {
                 costs: vec![
