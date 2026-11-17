@@ -16,7 +16,6 @@ struct SeekPreviewSettingsState {
     keep_days: Signal<i64>,
     start_at_position: Signal<bool>,
     rough_first: Signal<bool>,
-    other_version: Signal<bool>,
     loading: Signal<bool>,
     saving: Signal<bool>,
     saved: Signal<bool>,
@@ -32,7 +31,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
         keep_days: use_signal(|| 30),
         start_at_position: use_signal(|| false),
         rough_first: use_signal(|| false),
-        other_version: use_signal(|| false),
         loading: use_signal(|| true),
         saving: use_signal(|| false),
         saved: use_signal(|| false),
@@ -78,12 +76,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
                         .rough_first
                         .set(
                             cfg.trickplay_rough_first
-                                .unwrap_or(false),
-                        );
-                    load_state
-                        .other_version
-                        .set(
-                            cfg.trickplay_other_version
                                 .unwrap_or(false),
                         );
                     load_state
@@ -135,11 +127,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
             trickplay_rough_first: Some(
                 *state
                     .rough_first
-                    .peek(),
-            ),
-            trickplay_other_version: Some(
-                *state
-                    .other_version
                     .peek(),
             ),
             ..config
@@ -196,7 +183,6 @@ pub fn SeekPreviewSettingsPage(app_state: AppState) -> Element {
                 PreviewsStoragePanel {}
                 PreviewsStartPanel {}
                 PreviewsRoughPanel {}
-                PreviewsOtherVersionPanel {}
                 PreviewsAddonPanel {}
 
                 if let Some(error) = state.error.read().as_ref() {
@@ -272,7 +258,7 @@ fn PreviewsMainPanel() -> Element {
         Card { title: "Seek previews",
             ToggleRow {
                 label: "Make seek previews while streaming",
-                description: "Makes seek previews in the background while a video plays, by reading the file from its source a second time. Disabled by default.",
+                description: "Makes seek previews in the background while a video plays, by reading a file from an addon that has \"seek previews\" switched on. Disabled by default.",
                 checked: *state.enabled.read(),
                 disabled: *state.saving.read(),
                 on_change: move |value| {
@@ -282,13 +268,15 @@ fn PreviewsMainPanel() -> Element {
             }
             Notes {
                 costs: vec![
-                    "Until a video's previews are complete, each play reads up to the whole file a second time, which counts toward debrid, usenet and data limits.",
+                    "Until a video's previews are complete, each play also reads up to one whole file, which counts toward debrid, usenet and data limits.",
                     "Holds a second connection to the source and uses about one CPU core while previews are made.",
-                    "A source that allows only one connection may refuse the second or interrupt playback: see Per addon.",
+                    "A source that allows only one connection may refuse the second or interrupt playback: see Addons.",
                 ],
-                clients: vec!["The preview box may be empty until a video's previews are made."],
+                clients: vec![
+                    "The preview box may be empty until a video's previews are made, and stays empty when no addon has a file to read.",
+                ],
                 not_for: vec![
-                    "Live TV, IPTV addons, addons that bypass the Remux proxy, torrents, HLS streams, music, and videos under 5 minutes or over 4 hours.",
+                    "Live TV, torrents, HLS streams, music, and videos under 5 minutes or over 4 hours.",
                 ],
             }
         }
@@ -414,41 +402,10 @@ fn PreviewsRoughPanel() -> Element {
 }
 
 #[component]
-fn PreviewsOtherVersionPanel() -> Element {
-    let mut state = use_context::<SeekPreviewSettingsState>();
-    rsx! {
-        Card { title: "Another version",
-            ToggleRow {
-                label: "Use another version for previews",
-                description: "When the version being played cannot be read for previews, such as one from an IPTV addon, reads another version of the same movie or episode with the same length. Disabled by default.",
-                checked: *state.other_version.read(),
-                disabled: *state.saving.read() || !*state.enabled.read(),
-                on_change: move |value| {
-                    state.other_version.set(value);
-                    state.saved.set(false);
-                }
-            }
-            Notes {
-                costs: vec![
-                    "Reads a file nobody chose to play, up to the whole file, which counts toward that source's limits.",
-                    "Only local, WebDAV and cached debrid or usenet versions are read.",
-                    "If a file marked cached has left the debrid cache, reading it can start a download in your account.",
-                ],
-                clients: vec![
-                    "Previews can come from a different cut of the same length, or a file listed under the wrong episode.",
-                    "If the other version proves to be a different file, its previews are deleted, but clients that cache previews may keep showing them.",
-                ],
-                warn: true,
-            }
-        }
-    }
-}
-
-#[component]
 fn PreviewsAddonPanel() -> Element {
     rsx! {
         Card {
-            title: "Per addon",
+            title: "Addons",
             action: rsx! {
                 button {
                     r#type: "button",
@@ -462,14 +419,32 @@ fn PreviewsAddonPanel() -> Element {
             },
             div { style: "display:flex;flex-direction:column;gap:4px",
                 p { class: "field-hint",
-                    "Each addon that can have seek previews has its own \"Make seek previews\" switch and service filter, under Addons, Edit."
+                    "No addon is read until \"seek previews\" is switched on for it under Addons, Edit, Resources."
                 }
                 p { class: "field-hint",
-                    "The switch is enabled by default. Turn it off for an addon whose source allows only one connection."
+                    "With \"stream\" also on, Remux reads the version being played, or another version of the same movie or episode with the same length."
                 }
                 p { class: "field-hint",
-                    "An addon that combines several sources is judged stream by stream. Use its service filter to leave out a source that allows only one connection."
+                    "IPTV addons and addons that bypass the Remux proxy are never read. A video played from one gets previews only from another addon's file."
                 }
+            }
+            p {
+                class: "field-hint",
+                style: "border-left:2px solid var(--info);padding-left:10px",
+                "A dedicated addon makes previews quicker. Give it \"seek previews\" on and \"stream\" off, and sort its results by quickest to load. Remux needs a file the same length as the one being played, so strict filters there mean fewer previews. It is asked in the background, after a play starts."
+            }
+            Notes {
+                costs: vec![
+                    "A dedicated addon gets one lookup per movie or episode a day, after a play starts, and up to two short reads of its files to check their length.",
+                    "Another version is a file nobody chose to play. Up to the whole file is read, which counts toward that source's limits.",
+                    "Only local, WebDAV and cached debrid or usenet files are read in place of the one played.",
+                    "If a file marked cached has left the debrid cache, reading it can start a download in your account.",
+                ],
+                clients: vec![
+                    "Previews can come from a different cut of the same length, or a file listed under the wrong episode.",
+                    "If the other version proves to be a different file, its previews are deleted, but clients that cache previews may keep showing them.",
+                ],
+                warn: true,
             }
         }
     }

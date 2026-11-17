@@ -78,8 +78,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
     let mut edit_subtitle_extraction = use_signal(|| false);
     let mut edit_probe_on_scan = use_signal(|| false);
     let mut edit_service_filter = use_signal(String::new);
-    let mut edit_trickplay = use_signal(|| true);
-    let mut edit_trickplay_service_filter = use_signal(String::new);
 
     // Confirm-delete state
     let mut id_to_delete: Signal<Option<Uuid>> = use_signal(|| None);
@@ -181,8 +179,15 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                     let id = addon.id;
                                     let id_string = id.to_string();
                                     let is_user_tab = *active_tab.read() == "user";
-                                    let res_list = if is_user_tab {
-                                        addon.supported_resources_user.clone()
+                                    // Leave out "seek previews" from what the kind could offer:
+                                    // it is a permission, not something the addon gives.
+                                    let res_list: Vec<ResourceType> = if is_user_tab {
+                                        addon
+                                            .supported_resources_user
+                                            .iter()
+                                            .filter(|r| **r != ResourceType::SeekPreviews)
+                                            .cloned()
+                                            .collect()
                                     } else {
                                         addon.resources.clone()
                                     };
@@ -255,8 +260,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                                 edit_subtitle_extraction.set(a.subtitle_extraction);
                                                                 edit_probe_on_scan.set(a.probe_on_scan);
                                                                 edit_service_filter.set(a.service_filter.join(", "));
-                                                                edit_trickplay.set(a.trickplay);
-                                                                edit_trickplay_service_filter.set(a.trickplay_service_filter.join(", "));
                                                                 let has_catalog = a.resources.contains(&ResourceType::Catalog);
                                                                 edit_catalogs.set(Vec::new());
                                                                 edit_catalog_settings.set(std::collections::HashMap::new());
@@ -395,14 +398,14 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                 div { class: "addon-kind-card-desc", "{k.description}" }
                                                 div { class: "addon-kind-card-badges",
                                                     if is_user_tab {
-                                                        for res in k.supported_resources_user.iter() {
+                                                        for res in k.supported_resources_user.iter().filter(|r| **r != ResourceType::SeekPreviews) {
                                                             span { class: "addon-kind-badge", "{res}" }
                                                         }
                                                         for t in k.supported_types_user.iter() {
                                                             span { class: "addon-kind-type", "{t}" }
                                                         }
                                                     } else {
-                                                        for res in k.supported_resources.iter() {
+                                                        for res in k.supported_resources.iter().filter(|r| r.name != ResourceType::SeekPreviews) {
                                                             span { class: "addon-kind-badge", "{res.name}" }
                                                         }
                                                         for t in k.supported_types.iter() {
@@ -533,9 +536,15 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                 // Use supported_resources from the addon row (manifest-derived for Stremio,
                 // kind-static for others) as the checkbox option list.
                 let is_user_addon = !*edit_is_default.read();
+                // Seek previews are never made for music, so the switch is not offered there.
+                let is_music = edit_form_values.read().get("media_kind").and_then(|v| v.as_str()) == Some("track");
                 let resource_options: Vec<ResourceType> = find_addon(edit_id)
                     .map(|a| if is_user_addon { a.supported_resources_user } else { a.supported_resources })
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| !(is_music && *r == ResourceType::SeekPreviews))
+                    .collect();
+                let offers_seek_previews = resource_options.contains(&ResourceType::SeekPreviews);
                 rsx! {
                     div { class: "modal-backdrop",
                         div { class: "modal",
@@ -594,6 +603,9 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                 }
                                             }
                                         }
+                                        if offers_seek_previews {
+                                            span { class: "field-hint", "seek previews: Remux may read this addon's streams to make seek previews, which opens a second connection to the source. With stream off, the addon is asked in the background and its streams are never offered to viewers. Needs seek previews turned on under Streaming, Seek Previews." }
+                                        }
                                     }
                                 }
                                 // Types section
@@ -647,7 +659,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                             checked: *edit_http_redirect_stream.read(),
                                             on_change: move |v| edit_http_redirect_stream.set(v),
                                         }
-                                        span { class: "field-hint", "Streams that FFmpeg processes, whether remuxed into a new container or re-encoded, always run through Remux." }
+                                        span { class: "field-hint", "Streams that FFmpeg processes, whether remuxed into a new container or re-encoded, always run through Remux. Seek previews are not made from this addon's streams while this is on." }
                                     }
                                     div { class: "form-group",
                                         label { class: "form-label", "Bypass proxy service filter" }
@@ -658,30 +670,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                             oninput: move |e| edit_service_filter.set(e.value()),
                                         }
                                         span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to bypass Remux's proxy. Leave empty to apply to all." }
-                                    }
-                                }
-                                // Seek previews: never made for the IPTV kind or for music, so not offered there.
-                                if edit_resources.read().contains("stream") && !edit_kind.as_deref().is_some_and(|k| k.starts_with("iptv")) && edit_form_values.read().get("media_kind").and_then(|v| v.as_str()) != Some("track") {
-                                    div { class: "form-group",
-                                        ToggleRow {
-                                            label: "Make seek previews",
-                                            description: "Make seek previews from this addon's streams while seek previews are turned on under Streaming, Seek Previews. Enabled by default.",
-                                            checked: *edit_trickplay.read(),
-                                            on_change: move |v| edit_trickplay.set(v),
-                                        }
-                                        span { class: "field-hint", "Making previews opens a second connection to the source, so turn this off for sources that allow only one. Has no effect while \"Bypass Remux proxy\" is on." }
-                                    }
-                                    if *edit_trickplay.read() {
-                                        div { class: "form-group",
-                                            label { class: "form-label", "Seek preview service filter" }
-                                            input {
-                                                class: "form-input",
-                                                placeholder: "real-debrid, alldebrid",
-                                                value: "{edit_trickplay_service_filter}",
-                                                oninput: move |e| edit_trickplay_service_filter.set(e.value()),
-                                            }
-                                            span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to make seek previews for. Leave empty to apply to all. With a list, streams that name no service, such as IPTV VOD inside an addon that combines several sources, get none." }
-                                        }
                                     }
                                 }
                                 if edit_kind.as_deref().is_some_and(|k| k.starts_with("opendal")) && edit_resources.read().contains("stream") {
@@ -843,13 +831,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                 .map(|s| s.trim().to_lowercase())
                                                 .filter(|s| !s.is_empty())
                                                 .collect();
-                                            let trickplay = *edit_trickplay.peek();
-                                            let trickplay_service_filter: Vec<String> = edit_trickplay_service_filter
-                                                .peek()
-                                                .split(',')
-                                                .map(|s| s.trim().to_lowercase())
-                                                .filter(|s| !s.is_empty())
-                                                .collect();
                                             spawn(async move {
                                                 let payload = UpdateAddonRequest {
                                                     name: Some(name),
@@ -863,8 +844,6 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                     subtitle_extraction: Some(subtitle_extraction),
                                                     probe_on_scan: Some(probe_on_scan),
                                                     service_filter: Some(service_filter),
-                                                    trickplay: Some(trickplay),
-                                                    trickplay_service_filter: Some(trickplay_service_filter),
                                                 };
                                                 let addon_res = c.execute(UpdateAddon { id: edit_id, payload }).await;
                                                 let cat_res = if !catalog_updates.is_empty() {

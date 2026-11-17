@@ -29,14 +29,35 @@
 //! named as sheets, and go when a compose finds their sheet made or the set is
 //! done.
 //!
-//! With `TrickplayOtherVersion` also on, a pass whose file cannot be read goes
-//! on with another version of the same title that is certain to give the same
-//! pictures (see [`other_versions`]), into the same set: after the file's own
-//! read failed, or at once when its addon is not to be read. A version that
-//! fails is left alone for [`OTHER_FAILURE_WAIT`], and a pass reads at most
-//! [`MAX_SOURCES`] sources. When another version's read ends by itself short
-//! of the end with no sign that its source failed (a shorter file), the
-//! sheets it made are deleted.
+//! Who may be read is the addon's choice (see [`AddonRule`]): only streams
+//! of an enabled addon with the "seek previews" resource switched on, never
+//! IPTV, never an addon that bypasses the proxy while it gives streams, never
+//! a deleted addon's leftovers. With "stream" also on, the version played may
+//! be read, and another version of the same title that is certain to give the
+//! same pictures may stand in for it (see [`other_versions`]), into the same
+//! set: after the file's own read failed, or at once when its addon is not to
+//! be read.
+//!
+//! An addon with "seek previews" on and "stream" off is kept for seek
+//! previews only (see [`previews_only`]). No viewer is offered its streams:
+//! after a play has run [`START_DELAY`] and is still watched, while its set is
+//! not complete and the version played has a measured length, the pass asks
+//! it in the background (see [`PreviewFinder`]), at most once per title and
+//! addon in [`PREVIEW_ASKED_WAIT`] ([`PREVIEW_RETRY_WAIT`] after a failed ask),
+//! one ask per title at a time, each dropped after [`PREVIEW_ASK_WAIT`]. Its
+//! answers are kept apart from the title's versions (see
+//! [`db::PreviewSource`]) and read only through this server's own stream
+//! proxy. A stream of the same length is read in the addon's own order (see
+//! [`preview_versions`]); one with no known length is measured first, at most
+//! [`MAX_PREVIEW_MEASURES`] a play.
+//!
+//! The order of reading in one pass: up to [`MAX_PREVIEW_READS`] streams of
+//! addons kept for seek previews only, then the version played if its addon
+//! allows, then its other versions. A source that fails is left alone, for
+//! [`FAILURE_WAIT`] when it is the version played and [`OTHER_FAILURE_WAIT`]
+//! otherwise, and a pass reads at most [`MAX_SOURCES`] sources. When a
+//! stand-in's read ends by itself short of the end with no sign that its
+//! source failed (a shorter file), the sheets it made are deleted.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -49,6 +70,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use remux_sdks::stremio::ResourceType;
 use tokio::{sync::oneshot, task::JoinHandle};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -85,8 +107,28 @@ pub const START_DELAY: Duration = Duration::from_secs(15);
 pub const FAILURE_WAIT: Duration = Duration::from_secs(10 * 60);
 /// How long another version that could not be read is not read again.
 pub const OTHER_FAILURE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
-/// Sources one pass reads at most: the file played and other versions.
+/// Sources one pass reads at most: preview sources, the file played and
+/// other versions.
 pub const MAX_SOURCES: usize = 3;
+/// Streams of addons kept for seek previews only that one pass reads at most,
+/// before the version played. A choice; nothing was measured for it.
+pub const MAX_PREVIEW_READS: usize = 2;
+/// Streams of one answer of an addon kept for seek previews only that are
+/// kept, the first in its order that pass the checks. A choice; nothing was
+/// measured for it.
+pub const MAX_PREVIEW_KEPT: usize = 5;
+/// Kept streams with no known length that one play measures at most, one
+/// short read each. A choice; nothing was measured for it.
+pub const MAX_PREVIEW_MEASURES: usize = 2;
+/// How long one ask of an addon kept for seek previews only may take before
+/// it is dropped. A choice; nothing was measured for it.
+pub const PREVIEW_ASK_WAIT: Duration = Duration::from_secs(30);
+/// How long after an answer the same addon is not asked again for the same
+/// title. Its answer is kept as long (see [`db::PREVIEW_SOURCE_TTL`]).
+pub const PREVIEW_ASKED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long after a failed or dropped ask the same addon is not asked again
+/// for the same title. A choice; nothing was measured for it.
+pub const PREVIEW_RETRY_WAIT: Duration = Duration::from_secs(60 * 60);
 /// How long the size of another version is waited for before it is read.
 pub const SIZE_WAIT: Duration = Duration::from_secs(30);
 /// How often a pass checks that someone is still watching it.
@@ -209,8 +251,8 @@ pub enum Ineligible {
     TooLong,
     Iptv,
     Redirect,
-    /// The addon's own switch is off, or its service list leaves the stream
-    /// out.
+    /// The addon's "seek previews" resource is off, the addon is disabled, or
+    /// it was deleted.
     AddonExcluded,
     /// The addon the stream names could not be read, so its switches are not
     /// known.
@@ -231,15 +273,6 @@ pub fn rough_first(cfg: &api::ServerConfiguration) -> bool {
     enabled(cfg)
         && cfg
             .trickplay_rough_first
-            .unwrap_or(false)
-}
-
-/// Whether another version is read when the one played cannot be: both
-/// switches on.
-pub fn other_version(cfg: &api::ServerConfiguration) -> bool {
-    enabled(cfg)
-        && cfg
-            .trickplay_other_version
             .unwrap_or(false)
 }
 
@@ -469,30 +502,14 @@ pub fn kind_has_pictures(kind: &db::MediaKind) -> bool {
     )
 }
 
-/// Whether an addon's own switch and service list let a stream get pictures.
-/// An empty list allows every stream. A list allows only a stream whose
-/// service id or inner addon name equals an entry, ignoring ASCII case, so a
-/// stream that names neither gets none.
-pub fn addon_allows(
-    addon_trickplay: bool,
-    filter: &[String],
-    service_id: Option<&str>,
-    stream_addon: Option<&str>,
-) -> bool {
-    if !addon_trickplay {
-        return false;
-    }
-    if filter.is_empty() {
-        return true;
-    }
-    [service_id, stream_addon]
-        .into_iter()
-        .flatten()
-        .any(|name| {
-            filter
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(name))
-        })
+/// Whether an addon's resources make it one kept for seek previews only:
+/// "seek previews" on and "stream" off. No viewer is offered its streams: it
+/// is asked for them in the background, after a play starts (see
+/// [`PreviewFinder`]), and they are kept apart from the title's versions (see
+/// [`db::PreviewSource`]).
+pub fn previews_only(resources: &[ResourceType]) -> bool {
+    resources.contains(&ResourceType::SeekPreviews)
+        && !resources.contains(&ResourceType::Stream)
 }
 
 /// Whether an addon row is one of the IPTV kinds. A stored row carries its
@@ -501,88 +518,118 @@ fn is_iptv_kind(kind: &str) -> bool {
     matches!(kind, "iptv" | "iptv-m3u" | "iptv-xtream")
 }
 
-/// The checks that need the addon that produced the stream, before a pass.
-/// Item builders use the same checks through [`AddonRule`].
-pub fn eligible_pass(
-    addon: Option<&Addon>,
-    info: &StreamInfo,
-) -> Result<(), Ineligible> {
+/// The checks that need the addon that produced the stream, before a pass
+/// (see [`AddonRule`]). A stream with no addon is judged by its row alone; a
+/// stream whose addon was deleted is refused where it is read.
+pub fn eligible_pass(addon: Option<&Addon>) -> Result<(), Ineligible> {
     let Some(addon) = addon else {
         return Ok(());
     };
-    if is_iptv_kind(
-        &addon
-            .preset
-            .kind,
-    ) {
+    let rule = AddonRule::new(addon);
+    if rule.iptv {
         return Err(Ineligible::Iptv);
     }
-    if addon.http_redirect_stream {
+    if rule.redirect {
         return Err(Ineligible::Redirect);
     }
-    if !addon_allows(
-        addon.trickplay,
-        &addon.trickplay_service_filter,
-        info.service_id
-            .as_deref(),
-        info.stream_addon
-            .as_deref(),
-    ) {
+    if !rule.reads {
         return Err(Ineligible::AddonExcluded);
     }
     Ok(())
 }
 
-/// What advertising needs to know about one addon: the checks of
-/// [`eligible_pass`], kept in memory so item builders run no query.
+/// Who may be read for pictures, by one addon's switches, kept in memory so
+/// item builders run no query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddonRule {
     pub iptv: bool,
+    /// "Bypass Remux proxy" while "stream" is on. Its control is hidden with
+    /// "stream" off, so a stored value does not act then.
     pub redirect: bool,
-    pub trickplay: bool,
-    pub service_filter: Vec<String>,
+    /// Enabled, "seek previews" on, and not an IPTV kind: its streams may be
+    /// read for pictures.
+    pub reads: bool,
+    /// `reads`, with "stream" off (see [`previews_only`]).
+    pub preview_only: bool,
+    /// Its place in the addon order; preview sources are read in it.
+    pub priority: i64,
+    /// Asked for users with no addon list of their own (see [`in_scope`]).
+    pub is_default: bool,
+    /// Asked for every user.
+    pub system: bool,
 }
 
 impl AddonRule {
     pub fn new(addon: &Addon) -> Self {
+        let iptv = is_iptv_kind(
+            &addon
+                .preset
+                .kind,
+        );
+        let stream = addon
+            .resources
+            .contains(&ResourceType::Stream);
+        let reads = addon.enabled
+            && !iptv
+            && addon
+                .resources
+                .contains(&ResourceType::SeekPreviews);
         Self {
-            iptv: is_iptv_kind(
-                &addon
-                    .preset
-                    .kind,
-            ),
-            redirect: addon.http_redirect_stream,
-            trickplay: addon.trickplay,
-            service_filter: addon
-                .trickplay_service_filter
-                .clone(),
+            iptv,
+            redirect: addon.http_redirect_stream && stream,
+            reads,
+            preview_only: reads && !stream,
+            priority: addon.priority,
+            is_default: addon.is_default,
+            system: addon.system,
         }
     }
 
-    fn allows(&self, info: &StreamInfo) -> bool {
-        !self.iptv
-            && !self.redirect
-            && addon_allows(
-                self.trickplay,
-                &self.service_filter,
-                info.service_id
-                    .as_deref(),
-                info.stream_addon
-                    .as_deref(),
-            )
+    /// Whether this addon's streams may be read for pictures.
+    pub fn allows(&self) -> bool {
+        self.reads && !self.iptv && !self.redirect
     }
 }
 
 /// Every stored addon's [`AddonRule`], by addon id.
 pub type AddonRules = HashMap<Uuid, AddonRule>;
 
-/// Whether the addon that produced a stream lets it be advertised. A stream
-/// with no addon, or one whose addon is not in `rules`, is judged by its row
-/// alone.
+/// Whether the addon that produced a stream lets it be read. A stream with no
+/// addon is judged by its row alone; one whose addon is not in `rules` (it
+/// was deleted) is not read.
 pub fn addon_ok(rules: &AddonRules, info: &StreamInfo) -> bool {
-    info.addon_id
-        .and_then(|id| rules.get(&id))
-        .is_none_or(|rule| rule.allows(info))
+    match info.addon_id {
+        None => true,
+        Some(id) => rules
+            .get(&id)
+            .is_some_and(AddonRule::allows),
+    }
+}
+
+/// Whether some enabled addon is kept for seek previews only.
+pub fn has_preview_source(rules: &AddonRules) -> bool {
+    rules
+        .values()
+        .any(|rule| rule.preview_only)
+}
+
+/// Whether a user is asked an addon's streams: always for a system addon,
+/// for a user with an addon list of their own when it holds the addon, and
+/// otherwise when the addon is a default one. A deleted addon is not.
+pub fn in_scope(
+    rules: &AddonRules,
+    addon_id: Uuid,
+    limited_to: Option<&[Uuid]>,
+) -> bool {
+    rules
+        .get(&addon_id)
+        .is_some_and(|rule| {
+            rule.system
+                || match limited_to {
+                    Some(ids) => ids.contains(&addon_id),
+                    None => rule.is_default,
+                }
+        })
 }
 
 /// How another version of a title is held, cheapest to read first: a file on
@@ -629,17 +676,57 @@ fn held(info: &StreamInfo) -> Option<Held> {
     })
 }
 
+/// The checks a stream row passes to be read in place of the version played,
+/// all but its length: it is a stream row with no folder of its own, it
+/// passes the row checks, its addon is in `rules` and allows it, a plain link
+/// names a service that marks it cached (a cached mark alone is what IPTV on
+/// demand lists), a service's file lists its size, and its stored length is
+/// of the file it lists. Gives how it is held.
+fn stand_in(
+    row: &db::Media,
+    item_runtime_s: Option<i64>,
+    rules: &AddonRules,
+    has_own_folder: &impl Fn(Uuid) -> bool,
+) -> Option<Held> {
+    if row.kind != db::MediaKind::Stream || has_own_folder(row.id) {
+        return None;
+    }
+    let info = row
+        .stream_info
+        .as_ref()?;
+    eligible_row(row, info, runtime_s(row, item_runtime_s)).ok()?;
+    let allowed = info
+        .addon_id
+        .and_then(|id| rules.get(&id))
+        .is_some_and(AddonRule::allows);
+    if !allowed {
+        return None;
+    }
+    let held = held(info)?;
+    let size = info
+        .size
+        .filter(|s| *s > 0);
+    if held >= Held::Cached && size.is_none() {
+        return None;
+    }
+    let probed_size = row
+        .probe_data
+        .as_ref()
+        .and_then(|p| p.size);
+    if info.is_other_file(probed_size) {
+        return None;
+    }
+    Some(held)
+}
+
 /// The other versions of `playing`'s title that may be read in its place:
 /// a file on this server's disk, then one on a library addon's WebDAV
 /// server, then one a named service marks as cached (outside usenet before
 /// usenet), then the smallest listed file, then the listing order. Each must
 /// give the same pictures at the same places: its own measured length gives
 /// `playing`'s picture count (so none when `playing` has no measured length),
-/// it has no folder of its own, it passes the row checks, its addon is in
-/// `rules` and allows it, a plain link names a service that marks it cached
-/// (a cached mark alone is what IPTV on demand lists), a service's file lists
-/// its size, and its stored length is of the file it lists. `versions` are
-/// the title's stream rows.
+/// and it passes the checks of [`stand_in`]. `versions` are the title's
+/// stream rows.
 pub fn other_versions<'a>(
     playing: &db::Media,
     versions: &'a [db::Media],
@@ -653,38 +740,14 @@ pub fn other_versions<'a>(
     }
     let mut found: Vec<(Held, i64, i64, &db::Media)> = versions
         .iter()
-        .filter(|row| {
-            row.id != playing.id
-                && row.kind == db::MediaKind::Stream
-                && set_id(row) == set
-                && !has_own_folder(row.id)
-        })
+        .filter(|row| row.id != playing.id && set_id(row) == set)
         .filter_map(|row| {
-            let info = row
+            let held = stand_in(row, item_runtime_s, rules, &has_own_folder)?;
+            let size = row
                 .stream_info
-                .as_ref()?;
-            eligible_row(row, info, runtime_s(row, item_runtime_s)).ok()?;
-            let allowed = info
-                .addon_id
-                .and_then(|id| rules.get(&id))
-                .is_some_and(|rule| rule.allows(info));
-            if !allowed {
-                return None;
-            }
-            let held = held(info)?;
-            let size = info
-                .size
-                .filter(|s| *s > 0);
-            if held >= Held::Cached && size.is_none() {
-                return None;
-            }
-            let probed_size = row
-                .probe_data
                 .as_ref()
-                .and_then(|p| p.size);
-            if info.is_other_file(probed_size) {
-                return None;
-            }
+                .and_then(|info| info.size)
+                .filter(|s| *s > 0);
             Some((
                 held,
                 size.unwrap_or(i64::MAX),
@@ -695,6 +758,109 @@ pub fn other_versions<'a>(
         })
         .collect();
     found.sort_by_key(|(held, size, idx, _)| (*held, *size, *idx));
+    found
+        .into_iter()
+        .map(|(_, _, _, row)| row)
+        .collect()
+}
+
+/// The streams of `rows` that would stand in for `playing` (see
+/// [`stand_in`]) but for their length: measured to another picture count.
+/// One with no measured length is not counted, since its length is not
+/// known. None when `playing` has no measured length. Counted for the log
+/// when a play gets no pictures for want of a file of its length.
+pub fn other_lengths(
+    playing: &db::Media,
+    rows: &[db::Media],
+    item_runtime_s: Option<i64>,
+    rules: &AddonRules,
+    has_own_folder: impl Fn(Uuid) -> bool,
+) -> usize {
+    let set = set_id(playing);
+    if set == playing.id {
+        return 0;
+    }
+    rows.iter()
+        .filter(|row| {
+            row.id != playing.id && measured_ticks(row).is_some() && set_id(row) != set
+        })
+        .filter(|row| stand_in(row, item_runtime_s, rules, &has_own_folder).is_some())
+        .count()
+}
+
+/// The stored streams of addons kept for seek previews only that may be read
+/// for `playing`'s pictures. `rows` are the title's stored answers, each as a
+/// stream row under the title (see [`db::PreviewSource::to_stream_row`]).
+/// Each passes the checks of [`other_versions`], and its addon is still one
+/// kept for seek previews only. In the addon order, then in each addon's own
+/// order, not by size: an admin sorts a dedicated addon's results by quickest
+/// to load.
+pub fn preview_versions<'a>(
+    playing: &db::Media,
+    rows: &'a [db::Media],
+    item_runtime_s: Option<i64>,
+    rules: &AddonRules,
+    has_own_folder: impl Fn(Uuid) -> bool,
+) -> Vec<&'a db::Media> {
+    let set = set_id(playing);
+    if set == playing.id {
+        return Vec::new();
+    }
+    in_addon_order(
+        rows.iter()
+            .filter(|row| row.id != playing.id && set_id(row) == set),
+        item_runtime_s,
+        rules,
+        &has_own_folder,
+    )
+}
+
+/// The rows of `rows` that pass every check of [`preview_versions`] but have
+/// no measured length yet, in the same order: the ones one short read could
+/// make fit (see [`MAX_PREVIEW_MEASURES`]).
+pub fn preview_unmeasured<'a>(
+    rows: &'a [db::Media],
+    item_runtime_s: Option<i64>,
+    rules: &AddonRules,
+    has_own_folder: impl Fn(Uuid) -> bool,
+) -> Vec<&'a db::Media> {
+    in_addon_order(
+        rows.iter()
+            .filter(|row| measured_ticks(row).is_none()),
+        item_runtime_s,
+        rules,
+        &has_own_folder,
+    )
+}
+
+/// The rows that pass [`stand_in`] and whose addon is kept for seek previews
+/// only, by addon order, then by their place in the addon's answer.
+fn in_addon_order<'a>(
+    rows: impl Iterator<Item = &'a db::Media>,
+    item_runtime_s: Option<i64>,
+    rules: &AddonRules,
+    has_own_folder: &impl Fn(Uuid) -> bool,
+) -> Vec<&'a db::Media> {
+    let mut found: Vec<(i64, Uuid, i64, &db::Media)> = rows
+        .filter_map(|row| {
+            stand_in(row, item_runtime_s, rules, has_own_folder)?;
+            let addon_id = row
+                .stream_info
+                .as_ref()?
+                .addon_id?;
+            let rule = rules
+                .get(&addon_id)
+                .filter(|rule| rule.preview_only)?;
+            Some((
+                rule.priority,
+                addon_id,
+                row.idx
+                    .unwrap_or(i64::MAX),
+                row,
+            ))
+        })
+        .collect();
+    found.sort_by_key(|(priority, addon_id, idx, _)| (*priority, *addon_id, *idx));
     found
         .into_iter()
         .map(|(_, _, _, row)| row)
@@ -2061,14 +2227,16 @@ async fn prepare(ctx: AppContext, play: PlayStart) {
     let sessions = ctx
         .sessions
         .clone();
+    let finder = AppFinder { ctx: ctx.clone() };
     passes
-        .begin(
+        .begin_with(
             &play.play_session_id,
             plan,
             Arc::new(FfmpegRunner),
             move |device_id: &str, item_id: Uuid| {
                 watched_from(sessions.get_by_device(device_id), item_id)
             },
+            &finder,
         )
         .await;
 }
@@ -2203,14 +2371,18 @@ async fn resolve_plan(
         Some(id) => addon_from_read(Addon::get(&ctx.db, id).await)?,
         None => None,
     };
-    let refused = eligible_pass(addon.as_ref(), info).err();
+    // A deleted addon's leftover streams are not read: off until turned on.
+    let refused = if info
+        .addon_id
+        .is_some()
+        && addon.is_none()
+    {
+        Some(Ineligible::AddonExcluded)
+    } else {
+        eligible_pass(addon.as_ref()).err()
+    };
     let runtime_s = runtime.ok_or(Ineligible::NoRuntime)?;
     let cfg = db::Settings::get_config_or_default(&ctx.db).await;
-    if let Some(reason) = refused
-        && !other_version(&cfg)
-    {
-        return Err(reason);
-    }
     let root = root_dir(
         &ctx.config
             .data_dir,
@@ -2237,11 +2409,16 @@ async fn resolve_plan(
         estimate
     };
     let set_id = set_for(&root, &stream);
-    let others = if other_version(&cfg) && set_id != stream.id {
-        other_sources(ctx, &root, &stream, play.user_id).await
+    let rules = ctx
+        .sessions
+        .trickplay
+        .addon_rules();
+    let (others, other_lengths) = if set_id != stream.id {
+        other_sources(ctx, &root, &stream, play.user_id, &rules).await
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
+    let preview = preview_ask(&stream, set_id, &root, play.user_id, &rules);
     let plan = PassPlan {
         stream_id: stream.id,
         set_id,
@@ -2267,13 +2444,51 @@ async fn resolve_plan(
         ),
         others,
         other_version: None,
+        preview,
+        played_refused: None,
+        other_lengths,
     };
+    if plan
+        .preview
+        .is_some()
+    {
+        // Whether the version played stands behind a preview source or is
+        // replaced by another version is settled once they were asked.
+        return Ok(PassPlan {
+            played_refused: refused,
+            ..plan
+        });
+    }
     read_other_if_refused(plan, refused)
+}
+
+/// What asking the addons kept for seek previews only needs for a play (see
+/// [`PreviewFinder`]), or `None` when they are not to be asked: none is
+/// enabled, or the version played has no measured length (so no other file
+/// can be known to give its pictures), or it is not a stream row under a
+/// title, or it keeps a folder of its own.
+fn preview_ask(
+    playing: &db::Media,
+    set_id: Uuid,
+    root: &Path,
+    user_id: Uuid,
+    rules: &AddonRules,
+) -> Option<PreviewAsk> {
+    let title_id = playing.parent_id?;
+    let wanted = has_preview_source(rules)
+        && set_id != playing.id
+        && measured_ticks(playing).is_some();
+    wanted.then(|| PreviewAsk {
+        title_id,
+        playing: playing.clone(),
+        user_id,
+        root: root.to_path_buf(),
+    })
 }
 
 /// The addon a stream names, from its read: an error refuses the pass, since
 /// that addon's switches are then not known. A missing row (the addon was
-/// deleted) is no addon, and the stream is judged by its row alone.
+/// deleted) is no addon; the caller refuses that stream.
 fn addon_from_read(
     read: anyhow::Result<Option<Addon>>,
 ) -> Result<Option<Addon>, Ineligible> {
@@ -2287,19 +2502,39 @@ fn addon_from_read(
 }
 
 /// `plan` as it reads the version played, or, when its addon says not to read
-/// it (`refused`), as it reads the first of its other versions instead: that
-/// version is never opened. With no other version, there is no pass.
+/// it (`refused`), as it reads the first of its other versions instead (see
+/// [`read_other_instead`]).
 fn read_other_if_refused(
     mut plan: PassPlan,
     refused: Option<Ineligible>,
 ) -> Result<PassPlan, Ineligible> {
-    let Some(reason) = refused else {
-        return Ok(plan);
-    };
+    if let Some(reason) = refused {
+        read_other_instead(&mut plan, reason)?;
+    }
+    Ok(plan)
+}
+
+/// Moves `plan`, whose version played its addon says not to read (`reason`),
+/// to the first of its other sources: that version is never opened. With no
+/// other source there is no pass, and when the only streams there were give
+/// another number of pictures, one line says so.
+fn read_other_instead(
+    plan: &mut PassPlan,
+    reason: Ineligible,
+) -> Result<(), Ineligible> {
     if plan
         .others
         .is_empty()
     {
+        if plan.other_lengths > 0 {
+            info!(
+                set_id = %plan.set_id,
+                stream_id = %plan.stream_id,
+                %reason,
+                other_lengths = plan.other_lengths,
+                "trick play: no previews for this play: no stream of matching length was found"
+            );
+        }
         return Err(reason);
     }
     let first = plan
@@ -2312,31 +2547,73 @@ fn read_other_if_refused(
         "trick play: this version is not read; reading another version of this title for its pictures"
     );
     plan.read_other(first);
-    Ok(plan)
+    Ok(())
+}
+
+/// Puts the streams the addons kept for seek previews only gave (`found`)
+/// in front of `plan`'s other sources, at most [`MAX_PREVIEW_READS`], with
+/// the version played behind them when its addon allows. True when `plan`
+/// is then to move on to the first of them (see
+/// [`TrickplayPasses::next_source`]). With none found, `plan` reads as it
+/// would have without them: the version played, or, when its addon refused
+/// it, the first of its other versions, or nothing.
+fn put_preview_sources(plan: &mut PassPlan, found: Found) -> Result<bool, Ineligible> {
+    let refused = plan
+        .played_refused
+        .take();
+    plan.other_lengths += found.other_lengths;
+    let mut order: Vec<PassSource> = found
+        .sources
+        .into_iter()
+        .take(MAX_PREVIEW_READS)
+        .collect();
+    if order.is_empty() {
+        return match refused {
+            Some(reason) => read_other_instead(plan, reason).map(|()| false),
+            None => Ok(false),
+        };
+    }
+    if refused.is_none() {
+        order.push(PassSource {
+            stream_id: plan.stream_id,
+            input: plan
+                .input
+                .clone(),
+            info: plan
+                .played
+                .clone(),
+            kind: SourceKind::Played,
+        });
+    }
+    order.append(&mut plan.others);
+    plan.others = order;
+    Ok(true)
 }
 
 /// [`other_versions`] of a stored stream, from its title's stream rows as
-/// last listed, ready to be read. A user limited to some addons is never read
-/// another addon's file for.
+/// last listed, ready to be read, and how many rows would have stood in but
+/// for their length (see [`other_lengths`]). A user limited to some addons is
+/// never read another addon's file for.
 async fn other_sources(
     ctx: &AppContext,
     root: &Path,
     playing: &db::Media,
     user_id: Uuid,
-) -> Vec<PassSource> {
+    rules: &AddonRules,
+) -> (Vec<PassSource>, usize) {
     let Some(parent) = playing.parent_id else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let Ok(limited_to) = crate::addons::user_addon_override(&ctx.db, user_id).await
     else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let Some(mut title) = db::Media::get_by_id(&ctx.db, &parent)
         .await
         .ok()
         .flatten()
     else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let versions = match title
         .streams(&ctx.db)
@@ -2345,56 +2622,376 @@ async fn other_sources(
         Ok(versions) => versions,
         Err(error) => {
             warn!(%error, "trick play: could not list the other versions");
-            return Vec::new();
+            return (Vec::new(), 0);
         }
     };
-    let rules = ctx
-        .sessions
-        .trickplay
-        .addon_rules();
-    other_versions(playing, &versions, title.runtime, &rules, |id| {
-        set_dir(root, id).is_dir()
-    })
-    .into_iter()
-    .filter_map(|row| {
-        let info = row
-            .stream_info
-            .as_ref()?;
-        if let Some(ids) = &limited_to
-            && !info
-                .addon_id
-                .is_some_and(|id| ids.contains(&id))
-        {
-            return None;
-        }
-        Some(PassSource {
-            stream_id: row.id,
-            input: pass_input(
-                info,
-                row.id,
-                ctx.config
-                    .port,
-            ),
-            info: info.clone(),
-        })
-    })
-    .collect()
+    let has_own_folder = |id: Uuid| set_dir(root, id).is_dir();
+    let lengths =
+        other_lengths(playing, &versions, title.runtime, rules, has_own_folder);
+    let sources =
+        other_versions(playing, &versions, title.runtime, rules, has_own_folder)
+            .into_iter()
+            .filter_map(|row| {
+                let info = row
+                    .stream_info
+                    .as_ref()?;
+                if let Some(ids) = &limited_to
+                    && !info
+                        .addon_id
+                        .is_some_and(|id| ids.contains(&id))
+                {
+                    return None;
+                }
+                Some(PassSource {
+                    stream_id: row.id,
+                    input: pass_input(
+                        info,
+                        row.id,
+                        ctx.config
+                            .port,
+                    ),
+                    info: info.clone(),
+                    kind: SourceKind::Other,
+                })
+            })
+            .collect();
+    (sources, lengths)
 }
 
-/// Another version of a title, as a pass reads it (see [`other_versions`]).
+/// What a source of a pass is to the play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    /// The version played, behind the preview sources: it waits
+    /// [`FAILURE_WAIT`] after a failure, like any read of it.
+    Played,
+    /// Another version of the title (see [`other_versions`]).
+    Other,
+    /// A stream of an addon kept for seek previews only (see
+    /// [`preview_versions`]).
+    Preview,
+}
+
+/// A source a pass may read in place of the one it reads.
 #[derive(Debug, Clone)]
 pub(crate) struct PassSource {
     pub stream_id: Uuid,
     pub input: String,
     /// Its row as listed: its addon, and its size for the size check.
     pub info: StreamInfo,
+    pub kind: SourceKind,
+}
+
+/// What asking the addons kept for seek previews only needs (see
+/// [`PreviewFinder`]).
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewAsk {
+    /// The movie or episode played.
+    pub title_id: Uuid,
+    /// The version played: its set and length decide which streams fit.
+    pub playing: db::Media,
+    /// The user playing: an addon outside their list is neither asked nor
+    /// read for them.
+    pub user_id: Uuid,
+    /// Where the sets are, for the check that a stream has no folder of its
+    /// own.
+    pub root: PathBuf,
+}
+
+/// What a [`PreviewFinder`] found for a play.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Found {
+    /// The streams that may be read, in order (see [`preview_versions`]).
+    pub sources: Vec<PassSource>,
+    /// Stored streams that would have been read but for their length (see
+    /// [`other_lengths`]).
+    pub other_lengths: usize,
+}
+
+/// Asks the addons kept for seek previews only for a play's title, when they
+/// were not asked lately, and gives what of their stored answers may be read
+/// for its pictures. The app's own in production ([`AppFinder`]), a fake in
+/// tests. Called once a play has run its start delay and is still watched
+/// (see [`TrickplayPasses::begin_with`]), never while a title opens or a play
+/// starts.
+pub(crate) trait PreviewFinder: Send + Sync {
+    fn find(&self, ask: &PreviewAsk) -> impl Future<Output = Found> + Send;
+}
+
+/// A finder that finds nothing, for a pass with no addon kept for seek
+/// previews only.
+#[cfg(test)]
+pub(crate) struct NoFinder;
+
+#[cfg(test)]
+impl PreviewFinder for NoFinder {
+    fn find(&self, _ask: &PreviewAsk) -> impl Future<Output = Found> + Send {
+        std::future::ready(Found::default())
+    }
+}
+
+/// The finder of a running server: asks through
+/// [`crate::addons::AddonService::preview_streams`], then reads the stored
+/// answers.
+pub(crate) struct AppFinder {
+    pub ctx: AppContext,
+}
+
+impl PreviewFinder for AppFinder {
+    fn find(&self, ask: &PreviewAsk) -> impl Future<Output = Found> + Send {
+        find_preview_sources(&self.ctx, ask)
+    }
+}
+
+async fn find_preview_sources(ctx: &AppContext, ask: &PreviewAsk) -> Found {
+    let Some(mut title) = db::Media::get_by_id(&ctx.db, &ask.title_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Found::default();
+    };
+    // An episode's lookup needs its series' ids, as a viewer's lookup does.
+    let _ = title
+        .grandparent(&ctx.db)
+        .await;
+    ctx.addons
+        .preview_streams(&title, ctx, Some(ask.user_id))
+        .await;
+    // One play of a title at a time reads and measures its stored answers,
+    // so a row is measured once: a second play reads the length saved by
+    // the first.
+    static MEASURE_LOCKS: crate::keyed_lock::KeyedLock<Uuid> =
+        crate::keyed_lock::KeyedLock::new();
+    let _guard = MEASURE_LOCKS
+        .lock(ask.title_id)
+        .await;
+    let stored = match db::PreviewSource::list_fresh(
+        &ctx.db,
+        ask.title_id,
+        chrono::Utc::now().naive_utc(),
+    )
+    .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            warn!(%error, "trick play: could not read the preview sources");
+            return Found::default();
+        }
+    };
+    let Ok(limited_to) = crate::addons::user_addon_override(&ctx.db, ask.user_id).await
+    else {
+        return Found::default();
+    };
+    let passes = &ctx
+        .sessions
+        .trickplay;
+    let rules = passes.addon_rules();
+    // The rows are per title, not per user: an addon this user is not asked
+    // for is not read for them either.
+    let mut rows: Vec<db::Media> = stored
+        .iter()
+        .filter(|row| in_scope(&rules, row.addon_id, limited_to.as_deref()))
+        .map(|row| row.to_stream_row(title.runtime))
+        .collect();
+    let has_own_folder = |id: Uuid| set_dir(&ask.root, id).is_dir();
+    let set = set_id(&ask.playing);
+    let now = Instant::now();
+    let unmeasured: Vec<Uuid> =
+        preview_unmeasured(&rows, title.runtime, &rules, has_own_folder)
+            .into_iter()
+            .filter(|row| !passes.failed_recently(row.id, now))
+            .map(|row| row.id)
+            .collect();
+    if !unmeasured.is_empty()
+        && preview_versions(&ask.playing, &rows, title.runtime, &rules, has_own_folder)
+            .is_empty()
+    {
+        let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+        let wait = Duration::from_secs(
+            cfg.probe_timeout_secs
+                .and_then(|s| u64::try_from(s).ok())
+                .unwrap_or(20),
+        );
+        for id in unmeasured
+            .into_iter()
+            .take(MAX_PREVIEW_MEASURES)
+        {
+            let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+            else {
+                continue;
+            };
+            measure_preview_source(ctx, row, wait).await;
+            if set_id(row) == set {
+                break;
+            }
+        }
+    }
+    let port = ctx
+        .config
+        .port;
+    let sources =
+        preview_versions(&ask.playing, &rows, title.runtime, &rules, has_own_folder)
+            .into_iter()
+            .filter_map(|row| {
+                let info = row
+                    .stream_info
+                    .as_ref()?;
+                Some(PassSource {
+                    stream_id: row.id,
+                    input: pass_input(info, row.id, port),
+                    info: info.clone(),
+                    kind: SourceKind::Preview,
+                })
+            })
+            .collect();
+    Found {
+        sources,
+        other_lengths: other_lengths(
+            &ask.playing,
+            &rows,
+            title.runtime,
+            &rules,
+            has_own_folder,
+        ),
+    }
+}
+
+/// Measures a stored preview source the answer gave no length for: one
+/// ffprobe of its proxy link, within the server's probe timeout, saved on its
+/// stored row (never on a media row). A read that fails, or finds another
+/// file than the one listed, leaves it unread for [`OTHER_FAILURE_WAIT`], so
+/// a row is measured once.
+async fn measure_preview_source(ctx: &AppContext, row: &mut db::Media, wait: Duration) {
+    let Some(info) = row
+        .stream_info
+        .clone()
+    else {
+        return;
+    };
+    let input = pass_input(
+        &info,
+        row.id,
+        ctx.config
+            .port,
+    );
+    let started = Instant::now();
+    let probed = tokio::time::timeout(
+        wait,
+        tokio::task::spawn_blocking(move || {
+            crate::playback::probe::probe_media_with(&input, None, Some(wait))
+        }),
+    )
+    .await;
+    let passes = &ctx
+        .sessions
+        .trickplay;
+    match probed {
+        Ok(Ok(Ok((probe, _))))
+            if probe
+                .run_time_ticks
+                .is_some_and(|t| t > 0)
+                && !info.is_other_file(probe.size) =>
+        {
+            if let Err(error) =
+                db::PreviewSource::save_probe_data(&ctx.db, row.id, &probe).await
+            {
+                warn!(%error, "trick play: could not save a preview source's length");
+            }
+            info!(
+                stream_id = %row.id,
+                elapsed = ?started.elapsed(),
+                "trick play: measured a preview source"
+            );
+            row.probe_data = Some(probe);
+        }
+        _ => {
+            info!(
+                stream_id = %row.id,
+                elapsed = ?started.elapsed(),
+                "trick play: could not measure a preview source; it is not read"
+            );
+            passes.mark_failed(
+                row.id,
+                Instant::now()
+                    + passes
+                        .inner
+                        .limits
+                        .other_failure_wait,
+            );
+        }
+    }
+}
+
+/// The streams one answer of an addon kept for seek previews only gives that
+/// are worth keeping, at most [`MAX_PREVIEW_KEPT`], in the addon's order:
+/// each passes the row checks for `title`, is held where it can be read in
+/// place of another (a file on this server or a library addon's WebDAV
+/// server, or a link a named service marks as cached), and lists its size
+/// when a service holds it. Torrents, uncached links and links with no named
+/// service are never kept. Each carries its content key, as the title's own
+/// stream rows do.
+pub(crate) fn kept_preview_streams(
+    title: &db::Media,
+    answer: Vec<StreamInfo>,
+) -> Vec<db::NewPreviewSource> {
+    let mut seen = HashSet::new();
+    answer
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, info)| {
+            let row = db::Media {
+                kind: db::MediaKind::Stream,
+                parent_id: Some(title.id),
+                probe_data: info
+                    .probe_data
+                    .clone(),
+                stream_info: Some(info.clone()),
+                ..Default::default()
+            };
+            eligible_row(&row, &info, runtime_s(&row, title.runtime)).ok()?;
+            let held = held(&info)?;
+            if held >= Held::Cached
+                && info
+                    .size
+                    .filter(|s| *s > 0)
+                    .is_none()
+            {
+                return None;
+            }
+            let content_key = crate::addons::AddonService::stream_dedup_key(&row)
+                .unwrap_or_else(|| format!("source_{idx}"));
+            if !seen.insert(content_key.clone()) {
+                return None;
+            }
+            Some(db::NewPreviewSource {
+                content_key,
+                probe_data: row.probe_data,
+                stream_info: info,
+            })
+        })
+        .take(MAX_PREVIEW_KEPT)
+        .collect()
+}
+
+/// Whether a title's item may list a version its addon says not to read,
+/// because an addon kept for seek previews only may give a file in its place:
+/// one is enabled, and the title's last asks did not all keep nothing (see
+/// [`TrickplayPasses::kept_nothing`]). Read from memory, no query.
+pub fn preview_source_may_help(
+    rules: &AddonRules,
+    passes: &TrickplayPasses,
+    title_id: Uuid,
+) -> bool {
+    has_preview_source(rules) && !passes.kept_nothing(title_id)
 }
 
 /// Everything a queued pass needs.
 #[derive(Debug, Clone)]
 pub(crate) struct PassPlan {
     /// The stream read, for its proxy input, the logs and the failure wait:
-    /// the version played, or another (see `other_version`).
+    /// the version played, or another source (see `other_version`).
     pub stream_id: Uuid,
     /// The set its pictures belong to (see [`set_for`]).
     pub set_id: Uuid,
@@ -2421,17 +3018,29 @@ pub(crate) struct PassPlan {
     /// a queued pass may wait long after its play started, and again while it
     /// runs, so a switch turned off stops it. `None` in most tests.
     pub db: Option<sqlx::SqlitePool>,
-    /// Other versions still to try, in order, when the stream read cannot be
-    /// (see [`other_versions`]). Empty with `TrickplayOtherVersion` off.
+    /// Other sources still to try, in order, when the stream read cannot be:
+    /// preview sources, the version played, other versions (see
+    /// [`put_preview_sources`] and [`other_versions`]).
     pub others: Vec<PassSource>,
-    /// The listing of the stream in `stream_id` while it is another version
-    /// read in place of the one played; `None` while that one is read.
+    /// The listing of the stream in `stream_id` while it is a source read in
+    /// place of the one played; `None` while that one is read.
     pub other_version: Option<StreamInfo>,
+    /// What asking the addons kept for seek previews only needs, until they
+    /// are asked (see [`TrickplayPasses::begin_with`]); `None` when they are
+    /// not to be asked.
+    pub preview: Option<PreviewAsk>,
+    /// Why the version played may not be read, kept while the addons kept
+    /// for seek previews only are still to be asked.
+    pub played_refused: Option<Ineligible>,
+    /// Streams that would have stood in but for their length (see
+    /// [`other_lengths`]), for the log when nothing can be read.
+    pub other_lengths: usize,
 }
 
 impl PassPlan {
-    /// Reads `source`, another version of the title, from now on. The set and
-    /// its picture count stay the played version's.
+    /// Reads `source` from now on: another version, a preview source, or the
+    /// version played again behind the preview sources. The set and its
+    /// picture count stay the played version's.
     fn read_other(&mut self, source: PassSource) {
         self.stream_id = source.stream_id;
         self.input = source.input;
@@ -2440,7 +3049,7 @@ impl PassPlan {
             .size
             .and_then(|s| u64::try_from(s).ok())
             .filter(|s| *s > 0);
-        self.other_version = Some(source.info);
+        self.other_version = (source.kind != SourceKind::Played).then_some(source.info);
     }
 
     /// Reads what the plan of a play that joined this pass reads, from now
@@ -2989,6 +3598,20 @@ struct State {
     no_rough: HashMap<Uuid, Instant>,
     touched_at: HashMap<Uuid, Instant>,
     next_job: u64,
+    /// The last ask of each addon kept for seek previews only for each
+    /// title, by (title id, addon id): until when it is not asked again and
+    /// how many streams it kept. Pruned as it is written. Kept in memory
+    /// only: after a restart a title whose answer was empty or failed can be
+    /// asked once more, while one whose answer is stored is not (see
+    /// [`db::PreviewSource::has_fresh`]).
+    asked: HashMap<(Uuid, Uuid), Asked>,
+}
+
+/// One ask of an addon kept for seek previews only (see [`State::asked`]).
+#[derive(Debug, Clone, Copy)]
+struct Asked {
+    until: Instant,
+    kept: usize,
 }
 
 struct Inner {
@@ -2999,7 +3622,7 @@ struct Inner {
     addon_rules: Mutex<Arc<AddonRules>>,
 }
 
-/// What [`TrickplayPasses::begin`] did.
+/// What [`TrickplayPasses::begin_with`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Begin {
     /// The play ended, or was never registered: nothing queued.
@@ -3010,6 +3633,9 @@ pub(crate) enum Begin {
     /// [`OTHER_FAILURE_WAIT`] for another version), and no other version can
     /// be read in its place.
     FailedRecently,
+    /// The version played may not be read, and nothing can be read in its
+    /// place.
+    NoSource,
     /// A new pass was queued.
     Queued,
     /// The play joined a pass already queued or running. The stream its plan
@@ -3140,7 +3766,7 @@ impl TrickplayPasses {
         let rules = self.addon_rules();
         info.addon_id
             .and_then(|id| rules.get(&id))
-            .is_some_and(|rule| rule.allows(info))
+            .is_some_and(AddonRule::allows)
     }
 
     /// Puts one addon's rule in the snapshot, from its row as just saved, so
@@ -3166,29 +3792,26 @@ impl TrickplayPasses {
 
     /// Why the stream `plan` reads may not be read now, by the settings `cfg`
     /// and the addon rules as they are now; `None` while it may. The version
-    /// played follows [`addon_ok`], so a stream with no addon stays allowed.
-    /// The switches are judged only with `cfg`: `None` where the settings
-    /// were not read. Another version's addon is judged by the rules alone,
-    /// so a failed settings read does not skip it; a plan with no database
-    /// (most tests) skips it, as its stand-ins name no addon.
+    /// played follows [`addon_ok`], so a stream with no addon stays allowed
+    /// and one whose addon was deleted does not. The main switch is judged
+    /// only with `cfg`: `None` where the settings were not read. A stand-in's
+    /// addon (another version's, or a preview source's) is judged by the
+    /// rules alone, so a failed settings read does not skip it; a plan with
+    /// no database (most tests) skips it, as its stand-ins name no addon.
     fn refusal(
         &self,
         plan: &PassPlan,
         cfg: Option<&api::ServerConfiguration>,
     ) -> Option<SlotEnd> {
-        if let Some(cfg) = cfg {
-            let other_off = plan
-                .other_version
-                .is_some()
-                && !other_version(cfg);
-            if !enabled(cfg) || other_off {
-                info!(
-                    set_id = %plan.set_id,
-                    stream_id = %plan.stream_id,
-                    "trick play: switched off; not reading"
-                );
-                return Some(SlotEnd::Over);
-            }
+        if let Some(cfg) = cfg
+            && !enabled(cfg)
+        {
+            info!(
+                set_id = %plan.set_id,
+                stream_id = %plan.stream_id,
+                "trick play: switched off; not reading"
+            );
+            return Some(SlotEnd::Over);
         }
         if (cfg.is_some()
             || plan
@@ -3483,6 +4106,61 @@ impl TrickplayPasses {
             .contains_key(&stream_id)
     }
 
+    /// Whether an addon kept for seek previews only was asked for a title
+    /// lately: within [`PREVIEW_ASKED_WAIT`] of an answer, or
+    /// [`PREVIEW_RETRY_WAIT`] of a failed or dropped ask.
+    pub(crate) fn asked_recently(&self, title_id: Uuid, addon_id: Uuid) -> bool {
+        let now = Instant::now();
+        self.lock()
+            .asked
+            .get(&(title_id, addon_id))
+            .is_some_and(|asked| asked.until > now)
+    }
+
+    /// Records an ask of an addon kept for seek previews only for a title:
+    /// `kept` is how many streams its answer kept, `None` for an ask that
+    /// failed or was dropped.
+    pub(crate) fn mark_asked(
+        &self,
+        title_id: Uuid,
+        addon_id: Uuid,
+        kept: Option<usize>,
+    ) {
+        let now = Instant::now();
+        let (wait, kept) = match kept {
+            Some(kept) => (PREVIEW_ASKED_WAIT, kept),
+            None => (PREVIEW_RETRY_WAIT, 0),
+        };
+        let mut st = self.lock();
+        st.asked
+            .retain(|_, asked| asked.until > now);
+        st.asked
+            .insert(
+                (title_id, addon_id),
+                Asked {
+                    until: now + wait,
+                    kept,
+                },
+            );
+    }
+
+    /// Whether the title's last asks of addons kept for seek previews only
+    /// all kept nothing: then its item lists no version that only such an
+    /// addon could stand in for, until those asks may be made again. False
+    /// for a title not asked lately.
+    pub fn kept_nothing(&self, title_id: Uuid) -> bool {
+        let now = Instant::now();
+        let st = self.lock();
+        let mut last = st
+            .asked
+            .iter()
+            .filter(|((title, _), asked)| *title == title_id && asked.until > now)
+            .peekable();
+        last.peek()
+            .is_some()
+            && last.all(|(_, asked)| asked.kept == 0)
+    }
+
     /// Moves `plan` on to the next of its other versions that has not failed
     /// recently and has no folder of its own, dropping those passed over. The
     /// list was made when the play started: a version given a folder of its
@@ -3502,11 +4180,23 @@ impl TrickplayPasses {
             {
                 continue;
             }
-            info!(
-                set_id = %plan.set_id,
-                stream_id = %source.stream_id,
-                "trick play: reading another version of this title for its pictures"
-            );
+            match source.kind {
+                SourceKind::Preview => info!(
+                    set_id = %plan.set_id,
+                    stream_id = %source.stream_id,
+                    "trick play: reading a preview source's stream for this title's pictures"
+                ),
+                SourceKind::Played => info!(
+                    set_id = %plan.set_id,
+                    stream_id = %source.stream_id,
+                    "trick play: reading the version played for its pictures"
+                ),
+                SourceKind::Other => info!(
+                    set_id = %plan.set_id,
+                    stream_id = %source.stream_id,
+                    "trick play: reading another version of this title for its pictures"
+                ),
+            }
             plan.read_other(source);
             return true;
         }
@@ -3706,6 +4396,23 @@ impl TrickplayPasses {
             .any(|(id, pass)| *id != set_id && pass.waiting)
     }
 
+    /// [`Self::begin_with`] with a finder that finds nothing.
+    #[cfg(test)]
+    pub(crate) async fn begin<R, W>(
+        &self,
+        play_session_id: &str,
+        plan: PassPlan,
+        runner: Arc<R>,
+        watch: W,
+    ) -> Begin
+    where
+        R: PassRunner,
+        W: Fn(&str, Uuid) -> Option<Watched> + Send + Sync + 'static,
+    {
+        self.begin_with(play_session_id, plan, runner, watch, &NoFinder)
+            .await
+    }
+
     /// From a resolved file to a queued pass: attaches the play, waits the
     /// start delay, then queues a pass unless the play ended or is no longer
     /// on this item, the set is complete or the file failed recently and no
@@ -3714,16 +4421,26 @@ impl TrickplayPasses {
     /// `watch` tells, for a device and an item, whether that device's latest
     /// reported session is on that item, how long ago it reported and where
     /// it was. The pass asks it while it waits and while it runs.
-    pub(crate) async fn begin<R, W>(
+    ///
+    /// `finder` is asked for the streams of addons kept for seek previews
+    /// only once the start delay has passed, the play is still watched and
+    /// its set is not complete, and only when the plan wants them (see
+    /// [`PreviewAsk`]), the switch is still on and such an addon is still
+    /// enabled. So a play that ended in its first seconds, a finished set, or
+    /// a server with no such addon asks nothing. The version played is read
+    /// after them, when its addon allows (see [`put_preview_sources`]).
+    pub(crate) async fn begin_with<R, W, F>(
         &self,
         play_session_id: &str,
         mut plan: PassPlan,
         runner: Arc<R>,
         watch: W,
+        finder: &F,
     ) -> Begin
     where
         R: PassRunner,
         W: Fn(&str, Uuid) -> Option<Watched> + Send + Sync + 'static,
+        F: PreviewFinder,
     {
         if !self.attach(play_session_id, plan.set_id) {
             return Begin::Released;
@@ -3752,6 +4469,43 @@ impl TrickplayPasses {
         }
         if is_done(&set_dir(&plan.root, plan.set_id)) {
             return Begin::Done;
+        }
+        if let Some(ask) = plan
+            .preview
+            .take()
+        {
+            // The switch may have been turned off during the start delay.
+            let switched_on = match &plan.db {
+                Some(pool) => db::Settings::get_config(pool)
+                    .await
+                    .map_or(true, |cfg| enabled(&cfg)),
+                None => true,
+            };
+            let found = if switched_on && has_preview_source(&self.addon_rules()) {
+                finder
+                    .find(&ask)
+                    .await
+            } else {
+                Found::default()
+            };
+            match put_preview_sources(&mut plan, found) {
+                Ok(false) => {}
+                Ok(true) => {
+                    if !self.next_source(&mut plan) {
+                        return Begin::FailedRecently;
+                    }
+                }
+                Err(reason) => {
+                    debug!(
+                        item_id = %item_id,
+                        set_id = %plan.set_id,
+                        %reason,
+                        "no trick play pictures for this play"
+                    );
+                    self.release(play_session_id);
+                    return Begin::NoSource;
+                }
+            }
         }
         // Nothing is opened here, so a version passed over does not count
         // towards `MAX_SOURCES`.
@@ -4892,6 +5646,19 @@ fn moved_if_longer(plan: &PassPlan, dir: &Path, highest: u64) -> PathBuf {
 
 #[cfg(test)]
 impl TrickplayPasses {
+    /// Until when an addon kept for seek previews only is not asked again
+    /// for a title.
+    pub(crate) fn asked_until(
+        &self,
+        title_id: Uuid,
+        addon_id: Uuid,
+    ) -> Option<Instant> {
+        self.lock()
+            .asked
+            .get(&(title_id, addon_id))
+            .map(|asked| asked.until)
+    }
+
     fn registration_count(&self) -> usize {
         self.lock()
             .by_session
@@ -4974,6 +5741,9 @@ mod tests {
             db: None,
             others: Vec::new(),
             other_version: None,
+            preview: None,
+            played_refused: None,
+            other_lengths: 0,
         }
     }
 
@@ -5536,6 +6306,7 @@ mod tests {
         (media, info)
     }
 
+    /// An addon that gives streams and lets them be read for pictures.
     fn addon(kind: &str, redirect: bool) -> Addon {
         let now = chrono::Utc::now().naive_utc();
         Addon {
@@ -5545,7 +6316,7 @@ mod tests {
                 kind: kind.to_string(),
                 ..Default::default()
             },
-            resources: vec![],
+            resources: vec![ResourceType::Stream, ResourceType::SeekPreviews],
             types: vec![],
             enabled: true,
             priority: 0,
@@ -5557,8 +6328,28 @@ mod tests {
             subtitle_extraction: false,
             probe_on_scan: false,
             service_filter: vec![],
-            trickplay: true,
-            trickplay_service_filter: vec![],
+        }
+    }
+
+    /// An addon kept for seek previews only: "seek previews" on, "stream"
+    /// off.
+    fn preview_addon() -> Addon {
+        Addon {
+            resources: vec![ResourceType::SeekPreviews],
+            ..addon("stremio", false)
+        }
+    }
+
+    /// `addon` with "seek previews" switched off.
+    fn switched_off(addon: &Addon) -> Addon {
+        Addon {
+            resources: addon
+                .resources
+                .iter()
+                .filter(|r| **r != ResourceType::SeekPreviews)
+                .cloned()
+                .collect(),
+            ..addon.clone()
         }
     }
 
@@ -5606,19 +6397,6 @@ mod tests {
             "read only while the main switch is on"
         );
         assert!(rough_first(&switches(true, true)));
-        assert_eq!(cfg.trickplay_other_version, Some(false));
-        assert!(!other_version(&cfg));
-        let other = |main: bool, other: bool| api::ServerConfiguration {
-            trickplay_while_streaming: Some(main),
-            trickplay_other_version: Some(other),
-            ..Default::default()
-        };
-        assert!(!other_version(&other(true, false)));
-        assert!(
-            !other_version(&other(false, true)),
-            "read only while the main switch is on"
-        );
-        assert!(other_version(&other(true, true)));
         assert_eq!(cfg.trickplay_start_at_position, Some(false));
         assert!(!start_at_position(&cfg));
         let start = |main: bool, on: bool| api::ServerConfiguration {
@@ -5636,10 +6414,6 @@ mod tests {
             serde_json::json!({ "TrickplayWhileStreaming": true }),
         )
         .unwrap();
-        assert!(
-            !other_version(&saved),
-            "a saved document without it reads as off"
-        );
         assert!(
             !start_at_position(&saved),
             "a saved document without it reads as off"
@@ -5999,97 +6773,106 @@ mod tests {
 
     #[test]
     fn eligible_pass_rejects_iptv_kind_and_redirect() {
-        let (_, info) = row(StreamDescriptor::http(URL));
         assert_eq!(
-            eligible_pass(Some(&addon("iptv", false)), &info),
+            eligible_pass(Some(&addon("iptv", false))),
             Err(Ineligible::Iptv)
         );
         assert_eq!(
-            eligible_pass(Some(&addon("iptv-m3u", false)), &info),
+            eligible_pass(Some(&addon("iptv-m3u", false))),
             Err(Ineligible::Iptv)
         );
         assert_eq!(
-            eligible_pass(Some(&addon("iptv-xtream", false)), &info),
+            eligible_pass(Some(&addon("iptv-xtream", false))),
             Err(Ineligible::Iptv)
         );
         assert_eq!(
-            eligible_pass(Some(&addon("stremio", true)), &info),
+            eligible_pass(Some(&addon("stremio", true))),
             Err(Ineligible::Redirect)
         );
     }
 
+    /// The rule comes from the addon's own switches: "seek previews" lets its
+    /// streams be read, "stream" decides whether viewers also see them, and
+    /// a disabled addon is never read.
     #[test]
-    fn addon_allows_follows_switch_and_service_list() {
-        let filter = ["realdebrid".to_string(), "Inner Addon".to_string()];
-        // Off.
-        assert!(!addon_allows(false, &[], Some("realdebrid"), None));
-        assert!(!addon_allows(false, &filter, Some("realdebrid"), None));
-        // On with an empty filter.
-        assert!(addon_allows(true, &[], None, None));
-        assert!(addon_allows(true, &[], Some("torbox"), None));
-        // A filter matching the service.
-        assert!(addon_allows(true, &filter, Some("realdebrid"), None));
-        // A filter matching the inner addon name.
-        assert!(addon_allows(true, &filter, None, Some("Inner Addon")));
-        // Ignoring case.
-        assert!(addon_allows(true, &filter, Some("RealDebrid"), None));
-        assert!(addon_allows(true, &filter, None, Some("inner addon")));
-        // Neither in the list.
-        assert!(!addon_allows(
-            true,
-            &filter,
-            Some("torbox"),
-            Some("Other Addon")
-        ));
-        // No service and no addon name against a non-empty filter.
-        assert!(!addon_allows(true, &filter, None, None));
-    }
+    fn the_rule_follows_the_four_switch_combinations_and_enabled() {
+        let with = |resources: Vec<ResourceType>| {
+            AddonRule::new(&Addon {
+                resources,
+                ..addon("stremio", false)
+            })
+        };
+        let both = with(vec![ResourceType::Stream, ResourceType::SeekPreviews]);
+        assert!(both.reads && !both.preview_only && both.allows());
+        let only_previews = with(vec![ResourceType::SeekPreviews]);
+        assert!(only_previews.reads && only_previews.preview_only);
+        assert!(only_previews.allows());
+        let only_stream = with(vec![ResourceType::Stream]);
+        assert!(!only_stream.reads && !only_stream.preview_only);
+        assert!(!only_stream.allows());
+        let neither = with(vec![ResourceType::Meta]);
+        assert!(!neither.reads && !neither.preview_only);
 
-    #[test]
-    fn eligible_pass_rejects_addon_switched_off_and_filtered_service() {
-        let (_, mut info) = row(StreamDescriptor::http(URL));
-        info.service_id = Some("realdebrid".to_string());
+        let disabled = AddonRule::new(&Addon {
+            enabled: false,
+            ..preview_addon()
+        });
+        assert!(!disabled.reads && !disabled.preview_only);
+        let iptv = AddonRule::new(&Addon {
+            resources: vec![ResourceType::SeekPreviews],
+            ..addon("iptv-m3u", false)
+        });
+        assert!(!iptv.reads && !iptv.preview_only);
 
-        let mut off = addon("stremio", false);
-        off.trickplay = false;
+        // "Bypass Remux proxy" acts only while "stream" is on: its control is
+        // hidden with it off.
+        let bypass = |resources: Vec<ResourceType>| {
+            AddonRule::new(&Addon {
+                resources,
+                ..addon("stremio", true)
+            })
+        };
+        assert!(
+            !bypass(vec![ResourceType::Stream, ResourceType::SeekPreviews]).allows()
+        );
+        assert!(bypass(vec![ResourceType::SeekPreviews]).allows());
+
         assert_eq!(
-            eligible_pass(Some(&off), &info),
+            eligible_pass(Some(&switched_off(&addon("stremio", false)))),
             Err(Ineligible::AddonExcluded)
         );
-
-        let mut filtered = addon("stremio", false);
-        filtered.trickplay_service_filter = vec!["torbox".to_string()];
         assert_eq!(
-            eligible_pass(Some(&filtered), &info),
+            eligible_pass(Some(&Addon {
+                enabled: false,
+                ..addon("stremio", false)
+            })),
             Err(Ineligible::AddonExcluded)
         );
-        let (_, no_service) = row(StreamDescriptor::http(URL));
-        assert_eq!(
-            eligible_pass(Some(&filtered), &no_service),
-            Err(Ineligible::AddonExcluded)
-        );
-
-        filtered.trickplay_service_filter = vec!["RealDebrid".to_string()];
-        assert_eq!(eligible_pass(Some(&filtered), &info), Ok(()));
-        assert_eq!(
-            eligible_pass(Some(&filtered), &no_service),
-            Err(Ineligible::AddonExcluded)
-        );
+        assert!(previews_only(&[ResourceType::SeekPreviews]));
+        assert!(!previews_only(&[
+            ResourceType::Stream,
+            ResourceType::SeekPreviews
+        ]));
+        assert!(!previews_only(&[]));
     }
 
     #[test]
     fn addon_ok_follows_the_snapshot() {
         let passes = TrickplayPasses::new();
-        let mut off = addon("stremio", false);
-        off.trickplay = false;
+        let off = switched_off(&addon("stremio", false));
         let iptv = addon("iptv-m3u", false);
         let redirect = addon("stremio", true);
         let on = addon("stremio", false);
+        let disabled = Addon {
+            enabled: false,
+            ..addon("stremio", false)
+        };
         passes.set_addon_rules(&[
             off.clone(),
             iptv.clone(),
             redirect.clone(),
             on.clone(),
+            disabled.clone(),
         ]);
         let rules = passes.addon_rules();
         let from = |addon_id: Option<Uuid>| StreamInfo {
@@ -6100,13 +6883,55 @@ mod tests {
         assert!(!addon_ok(&rules, &from(Some(off.id))));
         assert!(!addon_ok(&rules, &from(Some(iptv.id))));
         assert!(!addon_ok(&rules, &from(Some(redirect.id))));
+        assert!(!addon_ok(&rules, &from(Some(disabled.id))));
         assert!(addon_ok(&rules, &from(Some(on.id))));
-        // Not in the snapshot, or no addon: judged by the row alone.
-        assert!(addon_ok(&rules, &from(Some(Uuid::new_v4()))));
+        // A deleted addon's leftovers are not read; a stream that names no
+        // addon is judged by its row alone.
+        assert!(!addon_ok(&rules, &from(Some(Uuid::new_v4()))));
         assert!(addon_ok(&rules, &from(None)));
+        assert!(!has_preview_source(&rules));
 
-        passes.set_addon_rules(&[on]);
-        assert!(addon_ok(&passes.addon_rules(), &from(Some(off.id))));
+        passes.set_addon_rules(&[on.clone()]);
+        assert!(!addon_ok(&passes.addon_rules(), &from(Some(off.id))));
+        assert!(addon_ok(&passes.addon_rules(), &from(Some(on.id))));
+
+        let dedicated = preview_addon();
+        passes.set_addon_rules(&[on, dedicated.clone()]);
+        assert!(has_preview_source(&passes.addon_rules()));
+        assert!(addon_ok(&passes.addon_rules(), &from(Some(dedicated.id))));
+        passes.set_addon_rules(&[Addon {
+            enabled: false,
+            ..dedicated
+        }]);
+        assert!(
+            !has_preview_source(&passes.addon_rules()),
+            "a disabled addon is not a preview source"
+        );
+    }
+
+    /// A user is asked, and read, only the addons a viewer's lookup would ask
+    /// for them.
+    #[test]
+    fn the_scope_follows_the_users_list_default_addons_and_system_ones() {
+        let listed = preview_addon();
+        let not_default = Addon {
+            is_default: false,
+            ..preview_addon()
+        };
+        let system = Addon {
+            is_default: false,
+            system: true,
+            ..preview_addon()
+        };
+        let rules = rules_of(&[&listed, &not_default, &system]);
+        assert!(in_scope(&rules, listed.id, None));
+        assert!(!in_scope(&rules, not_default.id, None));
+        assert!(in_scope(&rules, system.id, None));
+        let own = [not_default.id];
+        assert!(!in_scope(&rules, listed.id, Some(&own)));
+        assert!(in_scope(&rules, not_default.id, Some(&own)));
+        assert!(in_scope(&rules, system.id, Some(&own)));
+        assert!(!in_scope(&rules, Uuid::new_v4(), None), "deleted");
     }
 
     #[test]
@@ -6122,9 +6947,8 @@ mod tests {
             let (media, info) = row(descriptor);
             assert_eq!(eligible_row(&media, &info, Some(RUNTIME)), Ok(()));
         }
-        let (_, info) = row(StreamDescriptor::http(URL));
-        assert_eq!(eligible_pass(None, &info), Ok(()));
-        assert_eq!(eligible_pass(Some(&addon("stremio", false)), &info), Ok(()));
+        assert_eq!(eligible_pass(None), Ok(()));
+        assert_eq!(eligible_pass(Some(&addon("stremio", false))), Ok(()));
     }
 
     #[test]
@@ -6939,7 +7763,7 @@ mod tests {
         );
         assert!(
             matches!(addon_from_read(Ok(None)), Ok(None)),
-            "a deleted addon: the stream is judged by its row alone"
+            "a deleted addon is no row; its stream is refused by its id"
         );
         let found = addon("stremio", false);
         let id = found.id;
@@ -6960,7 +7784,7 @@ mod tests {
         passes.set_addon_rules(std::slice::from_ref(&kept));
         let handed_out = passes.addon_rules();
 
-        changed.trickplay = false;
+        changed.resources = vec![ResourceType::Stream];
         passes.set_addon_rule(&changed);
         let rules = passes.addon_rules();
         assert_eq!(rules.get(&changed.id), Some(&AddonRule::new(&changed)));
@@ -6970,13 +7794,13 @@ mod tests {
             "a snapshot already handed out does not change"
         );
 
-        changed.trickplay = true;
+        changed.resources = vec![ResourceType::Stream, ResourceType::SeekPreviews];
         passes.set_addon_rule(&changed);
         assert!(
             passes
                 .addon_rules()
                 .get(&changed.id)
-                .is_some_and(|rule| rule.trickplay)
+                .is_some_and(|rule| rule.reads)
         );
 
         passes.drop_addon_rule(changed.id);
@@ -7062,7 +7886,7 @@ mod tests {
             )
             .await;
         assert_eq!(begun, Begin::Queued);
-        source.trickplay = false;
+        source.resources = vec![ResourceType::Stream];
         passes.set_addon_rule(&source);
         drop(held);
         until(|| !passes.is_queued(stream_id)).await;
@@ -7125,7 +7949,7 @@ mod tests {
                 == 1
         })
         .await;
-        source.trickplay = false;
+        source.resources = vec![ResourceType::Stream];
         passes.set_addon_rule(&source);
         until_named("the run stopped", || {
             runner
@@ -9858,16 +10682,17 @@ mod tests {
         refused.push(("measured from another file than it lists", row));
         let iptv = addon("iptv-m3u", false);
         let redirect = addon("stremio", true);
-        let mut off = addon("stremio", false);
-        off.trickplay = false;
-        let mut filtered = addon("stremio", false);
-        filtered.trickplay_service_filter = vec!["svc-other".to_string()];
-        let all = rules_of(&[&on, &iptv, &redirect, &off, &filtered]);
+        let off = switched_off(&addon("stremio", false));
+        let disabled = Addon {
+            enabled: false,
+            ..addon("stremio", false)
+        };
+        let all = rules_of(&[&on, &iptv, &redirect, &off, &disabled]);
         for (why, from) in [
             ("an IPTV addon", iptv.id),
             ("an addon that bypasses the proxy", redirect.id),
             ("an addon with previews off", off.id),
-            ("a service outside the addon's list", filtered.id),
+            ("a disabled addon", disabled.id),
             ("an addon not in the rules", Uuid::new_v4()),
         ] {
             refused.push((why, version(title, 7_200.0, from, 2)));
@@ -10000,6 +10825,7 @@ mod tests {
                 size: Some(LISTED as i64),
                 ..Default::default()
             },
+            kind: SourceKind::Other,
         }
     }
 
@@ -11127,7 +11953,7 @@ mod tests {
         assert_eq!(second, Begin::Joined);
         // Switched off once version-b's play has joined, before the slot is
         // free.
-        source.trickplay = false;
+        source.resources = vec![ResourceType::Stream];
         passes.set_addon_rule(&source);
         drop(held);
         until(|| !passes.is_queued(set_id)).await;
@@ -11197,7 +12023,6 @@ mod tests {
         let cfg = api::ServerConfiguration {
             trickplay_while_streaming: Some(true),
             trickplay_cache_size_mb: Some(1024),
-            trickplay_other_version: Some(true),
             ..Default::default()
         };
         db::Settings::set_config(&pool, &cfg)
@@ -11230,7 +12055,7 @@ mod tests {
         let dir = set_dir(tmp.path(), set_id);
         until_named("other-a made its sheets", || sheets_in(&dir).len() == 29).await;
         // Its addon's previews are turned off while its run waits at the end.
-        source.trickplay = false;
+        source.resources = vec![ResourceType::Stream];
         passes.set_addon_rule(&source);
         until_named("the run stopped", || {
             runner
@@ -11413,5 +12238,1107 @@ mod tests {
         // With the count of a longer stored length (sheets 0 to 3), the file
         // ends before that place.
         assert_eq!(run_end(&result, past_end, 100), RunEnd::Nothing);
+    }
+
+    // Addons kept for seek previews only.
+
+    /// A finder that hands back `sources`, with `other_lengths` stored
+    /// streams of another length, and counts its calls.
+    #[derive(Default)]
+    struct FakeFinder {
+        sources: Vec<PassSource>,
+        other_lengths: usize,
+        calls: AtomicUsize,
+    }
+
+    impl PreviewFinder for FakeFinder {
+        fn find(&self, _ask: &PreviewAsk) -> impl Future<Output = Found> + Send {
+            self.calls
+                .fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Found {
+                sources: self
+                    .sources
+                    .clone(),
+                other_lengths: self.other_lengths,
+            })
+        }
+    }
+
+    impl FakeFinder {
+        fn calls(&self) -> usize {
+            self.calls
+                .load(Ordering::SeqCst)
+        }
+    }
+
+    /// A stream of `addon`, kept for seek previews only, listed at
+    /// [`LISTED`] bytes, cached at a named service, read from `input`.
+    fn preview_source(input: &str, addon: &Addon) -> PassSource {
+        let mut source = other_source(input);
+        source
+            .info
+            .addon_id = Some(addon.id);
+        source.kind = SourceKind::Preview;
+        source
+    }
+
+    /// [`plan_with`], asking the addons kept for seek previews only.
+    fn preview_plan(root: &Path, set_id: Uuid, others: &[PassSource]) -> PassPlan {
+        PassPlan {
+            preview: Some(PreviewAsk {
+                title_id: Uuid::new_v4(),
+                playing: db::Media::default(),
+                user_id: Uuid::new_v4(),
+                root: root.to_path_buf(),
+            }),
+            ..plan_with(root, set_id, others)
+        }
+    }
+
+    /// Passes whose snapshot holds `dedicated`.
+    fn passes_with(dedicated: &Addon) -> TrickplayPasses {
+        let passes = TrickplayPasses::with_limits(fast());
+        passes.set_addon_rules(std::slice::from_ref(dedicated));
+        passes
+    }
+
+    #[test]
+    fn the_addons_are_asked_only_for_a_measured_version_with_one_enabled() {
+        let root = Path::new("/srv/trickplay");
+        let title = Uuid::new_v4();
+        let on = addon("stremio", false);
+        let dedicated = preview_addon();
+        let with = rules_of(&[&on, &dedicated]);
+        let without = rules_of(&[&on]);
+        let playing = version(title, 7_200.0, on.id, 0);
+        let set = set_id(&playing);
+        let user = Uuid::new_v4();
+
+        let ask = preview_ask(&playing, set, root, user, &with).expect("asked");
+        assert_eq!(ask.title_id, title);
+        assert_eq!(ask.user_id, user);
+        assert!(preview_ask(&playing, set, root, user, &without).is_none());
+        // Not measured: its set is its own, and no other file can be known
+        // to fit.
+        let unmeasured = db::Media {
+            probe_data: None,
+            ..playing.clone()
+        };
+        assert!(
+            preview_ask(&unmeasured, set_id(&unmeasured), root, user, &with).is_none()
+        );
+        // A version that keeps a folder of its own.
+        assert!(preview_ask(&playing, playing.id, root, user, &with).is_none());
+        // Not under a title.
+        let loose = db::Media {
+            parent_id: None,
+            ..playing.clone()
+        };
+        assert!(preview_ask(&loose, set, root, user, &with).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_finder_is_not_called_without_a_source_a_play_or_work_to_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+
+        // No addon kept for seek previews only is enabled any more.
+        let passes = TrickplayPasses::with_limits(fast());
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let set_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin_with(
+                "play-a",
+                preview_plan(tmp.path(), set_id, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(finder.calls(), 0);
+        assert_eq!(runner.inputs(), strings(&[PLAYED]));
+
+        // A play that ended within the start delay.
+        let passes = passes_with(&dedicated);
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        let begun = passes
+            .begin_with(
+                "play-b",
+                preview_plan(tmp.path(), Uuid::new_v4(), &[]),
+                runner.clone(),
+                never(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Released);
+        assert_eq!(finder.calls(), 0);
+
+        // A complete set.
+        let done = Uuid::new_v4();
+        let dir = set_dir(tmp.path(), done);
+        write_sheets(&dir, 0..29);
+        std::fs::write(dir.join(DONE_MARKER), b"").unwrap();
+        passes.register("play-c", Uuid::new_v4(), "device-c");
+        let begun = passes
+            .begin_with(
+                "play-c",
+                preview_plan(tmp.path(), done, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Done);
+        assert_eq!(finder.calls(), 0);
+
+        // A plan that does not ask (see `preview_ask`).
+        let plain = Uuid::new_v4();
+        passes.register("play-d", Uuid::new_v4(), "device-d");
+        passes
+            .begin_with(
+                "play-d",
+                plan_with(tmp.path(), plain, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(plain)).await;
+        assert_eq!(finder.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_preview_source_is_read_first_and_the_version_played_is_never_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let set_id = Uuid::new_v4();
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin_with(
+                "play-a",
+                preview_plan(tmp.path(), set_id, &[other_source("other-a")]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(finder.calls(), 1);
+        assert_eq!(runner.inputs(), strings(&["preview-a"]));
+        assert_eq!(
+            runner.sized(),
+            strings(&["preview-a"]),
+            "its size is checked as another version's is"
+        );
+        let dir = set_dir(tmp.path(), set_id);
+        assert!(is_done(&dir));
+        assert_eq!(sheets_in(&dir), (0..29).collect::<Vec<u32>>());
+    }
+
+    #[tokio::test]
+    async fn the_version_played_follows_two_preview_sources_and_three_files_at_most() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let set_id = Uuid::new_v4();
+        let found = [
+            preview_source("preview-a", &dedicated),
+            preview_source("preview-b", &dedicated),
+            preview_source("preview-c", &dedicated),
+        ];
+        let finder = FakeFinder {
+            sources: found.to_vec(),
+            ..Default::default()
+        };
+
+        // Two preview sources fail: the version played is read next.
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["preview-a", "preview-b"]),
+            ..Default::default()
+        });
+        let plan = preview_plan(tmp.path(), set_id, &[other_source("other-a")]);
+        let played = plan.stream_id;
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin_with("play-a", plan, runner.clone(), always(), &finder)
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner.inputs(),
+            strings(&["preview-a", "preview-b", PLAYED]),
+            "never a third preview source"
+        );
+        assert!(is_done(&set_dir(tmp.path(), set_id)));
+        let now = Instant::now();
+        assert!(
+            passes.failed_recently(found[0].stream_id, now + FAILURE_WAIT),
+            "a preview source waits as another version does"
+        );
+        assert!(!passes.failed_recently(played, now));
+
+        // Everything fails: three files are opened, no more.
+        let passes = passes_with(&dedicated);
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["preview-a", "preview-b", "preview-c", PLAYED, "other-a"]),
+            ..Default::default()
+        });
+        let plan = preview_plan(tmp.path(), set_id, &[other_source("other-a")]);
+        let played = plan.stream_id;
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        passes
+            .begin_with("play-b", plan, runner.clone(), always(), &finder)
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner.inputs(),
+            strings(&["preview-a", "preview-b", PLAYED])
+        );
+        let now = Instant::now();
+        assert!(passes.failed_recently(played, now));
+        assert!(
+            !passes
+                .failed_recently(played, now + FAILURE_WAIT + Duration::from_secs(1)),
+            "the version played waits as it always does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_played_its_addon_refuses_gets_pictures_only_from_a_preview_source()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let refused = |set_id: Uuid| PassPlan {
+            played_refused: Some(Ineligible::AddonExcluded),
+            ..preview_plan(tmp.path(), set_id, &[])
+        };
+
+        let set_id = Uuid::new_v4();
+        let finder = FakeFinder {
+            sources: vec![
+                preview_source("preview-a", &dedicated),
+                preview_source("preview-b", &dedicated),
+            ],
+            ..Default::default()
+        };
+        let runner_dead = Arc::new(FakeRunner {
+            sheets: 29,
+            dead: strings(&["preview-a", "preview-b"]),
+            ..Default::default()
+        });
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin_with(
+                "play-a",
+                refused(set_id),
+                runner_dead.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner_dead.inputs(),
+            strings(&["preview-a", "preview-b"]),
+            "the version played is never opened"
+        );
+
+        let set_id = Uuid::new_v4();
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-c", &dedicated)],
+            ..Default::default()
+        };
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        passes
+            .begin_with("play-b", refused(set_id), runner.clone(), always(), &finder)
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.inputs(), strings(&["preview-c"]));
+        assert!(is_done(&set_dir(tmp.path(), set_id)));
+
+        // Nothing found, nothing listed: no pass.
+        let finder = FakeFinder {
+            other_lengths: 2,
+            ..Default::default()
+        };
+        passes.register("play-c", Uuid::new_v4(), "device-c");
+        let begun = passes
+            .begin_with(
+                "play-c",
+                refused(Uuid::new_v4()),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::NoSource);
+        assert_eq!(finder.calls(), 1);
+
+        // Nothing found: another listed version stands in, as before.
+        let set_id = Uuid::new_v4();
+        passes.register("play-d", Uuid::new_v4(), "device-d");
+        passes
+            .begin_with(
+                "play-d",
+                PassPlan {
+                    others: vec![other_source("other-a")],
+                    ..refused(set_id)
+                },
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.inputs(), strings(&["preview-c", "other-a"]));
+    }
+
+    #[test]
+    fn preview_sources_go_first_and_the_version_played_behind_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let found = Found {
+            sources: vec![
+                preview_source("preview-a", &dedicated),
+                preview_source("preview-b", &dedicated),
+                preview_source("preview-c", &dedicated),
+            ],
+            other_lengths: 1,
+        };
+        let other = other_source("other-a");
+        let mut plan = preview_plan(tmp.path(), Uuid::new_v4(), &[other.clone()]);
+        let played = plan.stream_id;
+        assert_eq!(put_preview_sources(&mut plan, found.clone()), Ok(true));
+        let order: Vec<(String, SourceKind)> = plan
+            .others
+            .iter()
+            .map(|s| {
+                (
+                    s.input
+                        .clone(),
+                    s.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("preview-a".to_string(), SourceKind::Preview),
+                ("preview-b".to_string(), SourceKind::Preview),
+                (PLAYED.to_string(), SourceKind::Played),
+                ("other-a".to_string(), SourceKind::Other),
+            ]
+        );
+        assert_eq!(plan.others[2].stream_id, played);
+        assert_eq!(plan.other_lengths, 1);
+
+        // Read again behind them, the version played is read as itself.
+        let mut read = plan.clone();
+        read.read_other(plan.others[0].clone());
+        assert!(
+            read.other_version
+                .is_some()
+        );
+        read.read_other(plan.others[2].clone());
+        assert_eq!(read.stream_id, played);
+        assert!(
+            read.other_version
+                .is_none()
+        );
+
+        // Refused: not behind them.
+        let mut plan = PassPlan {
+            played_refused: Some(Ineligible::AddonExcluded),
+            ..preview_plan(tmp.path(), Uuid::new_v4(), &[])
+        };
+        assert_eq!(put_preview_sources(&mut plan, found), Ok(true));
+        assert!(
+            plan.others
+                .iter()
+                .all(|s| s.kind == SourceKind::Preview)
+        );
+        assert!(
+            plan.played_refused
+                .is_none()
+        );
+
+        // None found: as without them.
+        let mut plan = preview_plan(tmp.path(), Uuid::new_v4(), &[other.clone()]);
+        assert_eq!(put_preview_sources(&mut plan, Found::default()), Ok(false));
+        assert_eq!(plan.input, PLAYED);
+        assert_eq!(
+            plan.others
+                .len(),
+            1
+        );
+        let mut plan = PassPlan {
+            played_refused: Some(Ineligible::Redirect),
+            ..preview_plan(tmp.path(), Uuid::new_v4(), &[])
+        };
+        assert_eq!(
+            put_preview_sources(&mut plan, Found::default()),
+            Err(Ineligible::Redirect)
+        );
+    }
+
+    #[test]
+    fn preview_sources_are_read_in_the_addons_order_not_by_size() {
+        let title = Uuid::new_v4();
+        let on = addon("stremio", false);
+        let first = Addon {
+            priority: 1,
+            ..preview_addon()
+        };
+        let second = Addon {
+            priority: 2,
+            ..preview_addon()
+        };
+        let rules = rules_of(&[&on, &first, &second]);
+        let playing = version(title, 7_200.0, on.id, 0);
+        let mut big = version(title, 7_200.0, first.id, 0);
+        info_of(&mut big).size = Some(LISTED as i64 * 4);
+        let small = version(title, 7_200.0, first.id, 1);
+        let mut local = version(title, 7_200.0, second.id, 0);
+        info_of(&mut local).descriptor =
+            StreamDescriptor::Local("/media/invented-film.mkv".into());
+        let rows = [local.clone(), small.clone(), big.clone()];
+        let order: Vec<Uuid> =
+            preview_versions(&playing, &rows, None, &rules, |_| false)
+                .iter()
+                .map(|m| m.id)
+                .collect();
+        assert_eq!(order, vec![big.id, small.id, local.id]);
+
+        // A version a viewer is offered is never a preview source.
+        let listed = version(title, 7_200.0, on.id, 0);
+        assert!(
+            preview_versions(&playing, &[listed], None, &rules, |_| false).is_empty()
+        );
+    }
+
+    #[test]
+    fn preview_sources_that_cannot_stand_in_are_never_read() {
+        let title = Uuid::new_v4();
+        let on = addon("stremio", false);
+        let dedicated = preview_addon();
+        let rules = rules_of(&[&on, &dedicated]);
+        let playing = version(title, 7_200.0, on.id, 0);
+        let none_own = |_: Uuid| false;
+        let fits = version(title, 7_200.0, dedicated.id, 0);
+        assert_eq!(
+            preview_versions(
+                &playing,
+                std::slice::from_ref(&fits),
+                None,
+                &rules,
+                none_own
+            )
+            .len(),
+            1
+        );
+
+        let mut refused: Vec<(&str, db::Media)> =
+            vec![("another length", version(title, 7_300.0, dedicated.id, 0))];
+        let mut row = version(title, 7_200.0, dedicated.id, 0);
+        info_of(&mut row).service_cached = None;
+        refused.push(("not cached", row));
+        let mut row = version(title, 7_200.0, dedicated.id, 0);
+        info_of(&mut row).service_id = None;
+        refused.push(("no named service", row));
+        let mut row = version(title, 7_200.0, dedicated.id, 0);
+        info_of(&mut row).size = None;
+        refused.push(("no size", row));
+        let mut row = version(title, 7_200.0, dedicated.id, 0);
+        info_of(&mut row).descriptor = StreamDescriptor::Torrent {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            file_hint: None,
+            file_idx: None,
+            trackers: vec![],
+        };
+        refused.push(("a torrent", row));
+        refused.push((
+            "another title",
+            version(Uuid::new_v4(), 7_200.0, dedicated.id, 0),
+        ));
+        for (why, row) in &refused {
+            assert!(
+                preview_versions(
+                    &playing,
+                    std::slice::from_ref(row),
+                    None,
+                    &rules,
+                    none_own
+                )
+                .is_empty(),
+                "{why}"
+            );
+        }
+        let lengths = other_lengths(
+            &playing,
+            &[version(title, 7_300.0, dedicated.id, 0), fits.clone()],
+            None,
+            &rules,
+            none_own,
+        );
+        assert_eq!(lengths, 1, "only the one of another length");
+
+        // Its addon given "stream" again, switched off, or deleted.
+        for (why, rules) in [
+            (
+                "stream on",
+                rules_of(&[
+                    &on,
+                    &Addon {
+                        resources: vec![
+                            ResourceType::Stream,
+                            ResourceType::SeekPreviews,
+                        ],
+                        ..dedicated.clone()
+                    },
+                ]),
+            ),
+            ("switched off", rules_of(&[&on, &switched_off(&dedicated)])),
+            ("deleted", rules_of(&[&on])),
+        ] {
+            assert!(
+                preview_versions(
+                    &playing,
+                    std::slice::from_ref(&fits),
+                    None,
+                    &rules,
+                    none_own
+                )
+                .is_empty(),
+                "{why}"
+            );
+        }
+
+        // One with no length yet is worth measuring; a measured one is not.
+        let unmeasured = db::Media {
+            probe_data: None,
+            ..version(title, 7_200.0, dedicated.id, 1)
+        };
+        let rows = [fits.clone(), unmeasured.clone()];
+        let to_measure: Vec<Uuid> =
+            preview_unmeasured(&rows, Some(7_200), &rules, none_own)
+                .iter()
+                .map(|m| m.id)
+                .collect();
+        assert_eq!(to_measure, vec![unmeasured.id]);
+    }
+
+    #[test]
+    fn an_answer_keeps_the_first_five_it_can_read_in_its_order() {
+        let film = db::Media {
+            id: Uuid::new_v4(),
+            title: "Invented Film".to_string(),
+            kind: db::MediaKind::Movie,
+            runtime: Some(7_200),
+            ..Default::default()
+        };
+        let cached = |name: &str| StreamInfo {
+            descriptor: StreamDescriptor::http(format!(
+                "http://example.invalid/{name}.mkv"
+            )),
+            filename: Some(format!("{name}.mkv")),
+            service_id: Some("svc-cached".to_string()),
+            service_cached: Some(true),
+            size: Some(LISTED as i64),
+            ..Default::default()
+        };
+        let answer = vec![
+            StreamInfo {
+                service_cached: None,
+                ..cached("uncached")
+            },
+            cached("a"),
+            StreamInfo {
+                descriptor: StreamDescriptor::Torrent {
+                    info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    file_hint: None,
+                    file_idx: None,
+                    trackers: vec![],
+                },
+                ..cached("torrent")
+            },
+            cached("b"),
+            cached("a"),
+            StreamInfo {
+                size: None,
+                ..cached("unsized")
+            },
+            StreamInfo {
+                service_id: None,
+                ..cached("no-service")
+            },
+            StreamInfo {
+                descriptor: StreamDescriptor::Local("/media/invented-film.mkv".into()),
+                size: None,
+                ..cached("local")
+            },
+            cached("c"),
+            cached("d"),
+            cached("e"),
+        ];
+        let kept = kept_preview_streams(&film, answer);
+        let names: Vec<String> = kept
+            .iter()
+            .filter_map(|s| {
+                s.stream_info
+                    .filename
+                    .clone()
+            })
+            .collect();
+        assert_eq!(names, ["a.mkv", "b.mkv", "local.mkv", "c.mkv", "d.mkv"]);
+        assert_ne!(kept[0].content_key, kept[1].content_key);
+    }
+
+    #[test]
+    fn an_ask_that_kept_nothing_holds_the_title_back_until_it_may_be_asked_again() {
+        let passes = TrickplayPasses::new();
+        let dedicated = preview_addon();
+        passes.set_addon_rules(std::slice::from_ref(&dedicated));
+        let rules = passes.addon_rules();
+        let (title, other_addon) = (Uuid::new_v4(), Uuid::new_v4());
+
+        assert!(!passes.kept_nothing(title), "never asked");
+        assert!(preview_source_may_help(&rules, &passes, title));
+        assert!(!passes.asked_recently(title, dedicated.id));
+
+        passes.mark_asked(title, dedicated.id, Some(0));
+        assert!(
+            passes.asked_recently(title, dedicated.id),
+            "not asked again"
+        );
+        assert!(passes.kept_nothing(title));
+        assert!(
+            !preview_source_may_help(&rules, &passes, title),
+            "its item lists no version only a preview source could help"
+        );
+        assert!(!passes.kept_nothing(Uuid::new_v4()));
+
+        passes.mark_asked(title, other_addon, Some(3));
+        assert!(!passes.kept_nothing(title), "another addon kept something");
+
+        // A failed ask waits the short time; an answer the long one.
+        let failed = Uuid::new_v4();
+        passes.mark_asked(failed, dedicated.id, None);
+        assert!(passes.asked_recently(failed, dedicated.id));
+        assert!(passes.kept_nothing(failed));
+        let asked_until = |title: Uuid| {
+            passes
+                .lock()
+                .asked
+                .get(&(title, dedicated.id))
+                .map(|asked| asked.until)
+                .unwrap()
+        };
+        let now = Instant::now();
+        assert!(asked_until(failed) <= now + PREVIEW_RETRY_WAIT);
+        assert!(
+            asked_until(failed) > now + PREVIEW_RETRY_WAIT - Duration::from_secs(60)
+        );
+        assert!(
+            asked_until(title) > now + PREVIEW_ASKED_WAIT - Duration::from_secs(60)
+        );
+
+        // With no preview source enabled, nothing is listed for one.
+        let none = TrickplayPasses::new();
+        assert!(!preview_source_may_help(&none.addon_rules(), &none, title));
+    }
+
+    #[tokio::test]
+    async fn a_preview_sources_wrong_size_or_short_end_is_handled_as_another_versions()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let finder = FakeFinder {
+            sources: vec![
+                preview_source("preview-a", &dedicated),
+                preview_source("preview-b", &dedicated),
+            ],
+            ..Default::default()
+        };
+
+        // Its source holds another file: not read.
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            wrong_size: strings(&["preview-a"]),
+            ..Default::default()
+        });
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin_with(
+                "play-a",
+                preview_plan(tmp.path(), set_id, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.sized(), strings(&["preview-a", "preview-b"]));
+        assert_eq!(runner.inputs(), strings(&["preview-b"]));
+        assert!(is_done(&set_dir(tmp.path(), set_id)));
+
+        // A shorter file: its sheets go and the next makes every one.
+        let passes = passes_with(&dedicated);
+        let set_id = Uuid::new_v4();
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            short: strings(&["preview-a"]),
+            ..Default::default()
+        });
+        passes.register("play-b", Uuid::new_v4(), "device-b");
+        passes
+            .begin_with(
+                "play-b",
+                preview_plan(tmp.path(), set_id, &[]),
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.inputs(), strings(&["preview-a", "preview-b"]));
+        assert_eq!(runner.starts(), vec![0, 0], "preview-b made every sheet");
+        let dir = set_dir(tmp.path(), set_id);
+        assert!(is_done(&dir));
+        assert_eq!(sheets_in(&dir), (0..29).collect::<Vec<u32>>());
+    }
+
+    #[tokio::test]
+    async fn a_preview_source_whose_addon_is_switched_off_while_it_waits_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = settings_db(true, 1024).await;
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let held = passes
+            .inner
+            .slots
+            .acquire()
+            .await
+            .unwrap();
+        let set_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin_with(
+                "play-a",
+                PassPlan {
+                    db: Some(pool.clone()),
+                    ..preview_plan(tmp.path(), set_id, &[])
+                },
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        passes.set_addon_rule(&switched_off(&dedicated));
+        drop(held);
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(
+            runner.inputs(),
+            strings(&[PLAYED]),
+            "preview-a is never opened; the version played is read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_finder_is_not_called_once_the_switch_is_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Turned off after the play started, within its start delay.
+        let pool = settings_db(false, 1024).await;
+        let dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let finder = FakeFinder {
+            sources: vec![preview_source("preview-a", &dedicated)],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            ..Default::default()
+        });
+        let set_id = Uuid::new_v4();
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        passes
+            .begin_with(
+                "play-a",
+                PassPlan {
+                    db: Some(pool.clone()),
+                    ..preview_plan(tmp.path(), set_id, &[])
+                },
+                runner.clone(),
+                always(),
+                &finder,
+            )
+            .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(finder.calls(), 0, "the addon is not asked");
+        assert!(
+            runner
+                .inputs()
+                .is_empty(),
+            "nothing is read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_source_switched_off_while_it_reads_leaves_no_sheets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = settings_db(true, 1024).await;
+        let mut dedicated = preview_addon();
+        let passes = passes_with(&dedicated);
+        let source = preview_source("preview-a", &dedicated);
+        let finder = FakeFinder {
+            sources: vec![source.clone()],
+            ..Default::default()
+        };
+        let runner = Arc::new(FakeRunner {
+            sheets: 29,
+            wait_for_cancel: true,
+            ..Default::default()
+        });
+        let set_id = Uuid::new_v4();
+        let plan = PassPlan {
+            db: Some(pool.clone()),
+            ..preview_plan(tmp.path(), set_id, &[])
+        };
+        // The version played failed lately, so nothing follows preview-a.
+        passes.mark_failed(plan.stream_id, Instant::now() + FAILURE_WAIT);
+        passes.register("play-a", Uuid::new_v4(), "device-a");
+        let begun = passes
+            .begin_with("play-a", plan, runner.clone(), always(), &finder)
+            .await;
+        assert_eq!(begun, Begin::Queued);
+        let dir = set_dir(tmp.path(), set_id);
+        until_named("preview-a made its sheets", || sheets_in(&dir).len() == 29).await;
+        // Its addon's seek previews are turned off while its run waits at the
+        // end.
+        dedicated.resources = vec![];
+        passes.set_addon_rule(&dedicated);
+        until_named("the run stopped", || {
+            runner
+                .killed
+                .load(Ordering::SeqCst)
+        })
+        .await;
+        until(|| !passes.is_queued(set_id)).await;
+        assert_eq!(runner.inputs(), strings(&["preview-a"]));
+        assert!(sheets_in(&dir).is_empty(), "{:?}", sheets_in(&dir));
+        assert!(
+            !passes.failed_recently(source.stream_id, Instant::now()),
+            "not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_preview_source_outside_the_users_addons_is_not_read() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut film = db::Media {
+            title: "Invented Film".to_string(),
+            kind: db::MediaKind::Movie,
+            runtime: Some(7_200),
+            external_ids: db::ExternalIds {
+                tmdb: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        film.save(&ctx.db)
+            .await
+            .unwrap();
+        let played_from = addon("stremio", false);
+        let default_one = preview_addon();
+        let not_default = Addon {
+            is_default: false,
+            ..preview_addon()
+        };
+        ctx.sessions
+            .trickplay
+            .set_addon_rules(&[
+                played_from.clone(),
+                default_one.clone(),
+                not_default.clone(),
+            ]);
+        for dedicated in [&default_one, &not_default] {
+            let row = version(film.id, 7_200.0, dedicated.id, 0);
+            db::PreviewSource::store(
+                &ctx.db,
+                film.id,
+                dedicated.id,
+                &[db::NewPreviewSource {
+                    content_key: "invented".to_string(),
+                    stream_info: row
+                        .stream_info
+                        .clone()
+                        .unwrap(),
+                    probe_data: row
+                        .probe_data
+                        .clone(),
+                }],
+                chrono::Utc::now().naive_utc(),
+            )
+            .await
+            .unwrap();
+        }
+        let ask = PreviewAsk {
+            title_id: film.id,
+            playing: version(film.id, 7_200.0, played_from.id, 0),
+            // No addon list of their own: only default addons are theirs.
+            user_id: Uuid::new_v4(),
+            root: tmp
+                .path()
+                .to_path_buf(),
+        };
+        let found = find_preview_sources(&ctx, &ask).await;
+        let read_from: Vec<Option<Uuid>> = found
+            .sources
+            .iter()
+            .map(|source| {
+                source
+                    .info
+                    .addon_id
+            })
+            .collect();
+        assert_eq!(read_from, vec![Some(default_one.id)]);
+    }
+
+    #[tokio::test]
+    async fn at_most_two_stored_preview_sources_are_measured_and_a_failed_one_waits() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut film = db::Media {
+            title: "Invented Film".to_string(),
+            kind: db::MediaKind::Movie,
+            runtime: Some(7_200),
+            external_ids: db::ExternalIds {
+                tmdb: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        film.save(&ctx.db)
+            .await
+            .unwrap();
+        let played_from = addon("stremio", false);
+        let dedicated = preview_addon();
+        ctx.sessions
+            .trickplay
+            .set_addon_rules(&[played_from.clone(), dedicated.clone()]);
+        // Three files with no length; nothing serves them, so no measure
+        // succeeds.
+        let answer: Vec<db::NewPreviewSource> = ["a", "b", "c"]
+            .iter()
+            .map(|key| db::NewPreviewSource {
+                content_key: key.to_string(),
+                stream_info: version(film.id, 7_200.0, dedicated.id, 0)
+                    .stream_info
+                    .unwrap(),
+                probe_data: None,
+            })
+            .collect();
+        db::PreviewSource::store(
+            &ctx.db,
+            film.id,
+            dedicated.id,
+            &answer,
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
+        let ask = PreviewAsk {
+            title_id: film.id,
+            playing: version(film.id, 7_200.0, played_from.id, 0),
+            user_id: Uuid::new_v4(),
+            root: tmp
+                .path()
+                .to_path_buf(),
+        };
+        let found = find_preview_sources(&ctx, &ask).await;
+        assert!(
+            found
+                .sources
+                .is_empty()
+        );
+        assert_eq!(
+            found.other_lengths, 0,
+            "an unknown length is not another length"
+        );
+        let passes = &ctx
+            .sessions
+            .trickplay;
+        let failed = |now: Instant| {
+            answer
+                .iter()
+                .filter(|source| {
+                    let id = db::PreviewSource::id_for(
+                        film.id,
+                        dedicated.id,
+                        &source.content_key,
+                    );
+                    passes.failed_recently(id, now)
+                })
+                .count()
+        };
+        assert_eq!(failed(Instant::now()), MAX_PREVIEW_MEASURES);
+
+        // A second play measures only the one not tried yet.
+        find_preview_sources(&ctx, &ask).await;
+        assert_eq!(failed(Instant::now()), 3);
+        // Last, since a look this far ahead forgets the waits.
+        assert_eq!(
+            failed(Instant::now() + OTHER_FAILURE_WAIT + Duration::from_secs(1)),
+            0,
+            "measured again after its wait"
+        );
     }
 }

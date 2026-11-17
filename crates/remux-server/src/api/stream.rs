@@ -47,13 +47,28 @@ pub async fn stream_proxy(
             .db,
         &id,
     )
-    .await?
-    .context_not_found("not found")?;
-
-    let descriptor = media
-        .stream_info
-        .map(|si| si.descriptor)
-        .context_not_found("media has no URL")?;
+    .await?;
+    let descriptor = match media {
+        Some(media) => media
+            .stream_info
+            .map(|si| si.descriptor)
+            .context_not_found("media has no URL")?,
+        // A stream an addon kept for seek previews only gave: never a media
+        // row, so this route, with the token, is the only way it is read.
+        None => {
+            db::PreviewSource::get_fresh(
+                &state
+                    .ctx
+                    .db,
+                id,
+                chrono::Utc::now().naive_utc(),
+            )
+            .await?
+            .context_not_found("not found")?
+            .stream_info
+            .descriptor
+        }
+    };
 
     if let Some(addon_id) = descriptor.addon_id() {
         let addon = state
@@ -152,6 +167,79 @@ mod tests {
                 .as_bytes()
                 .as_ref(),
             b"release"
+        );
+    }
+
+    /// A stream an addon kept for seek previews only gave is served to the
+    /// server's own reader by its id and token, and is nowhere among the
+    /// title's versions.
+    #[tokio::test]
+    async fn stream_proxy_serves_a_preview_source_only_with_the_token() {
+        let (server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("small.mkv");
+        std::fs::write(&file, b"small release").unwrap();
+        let mut film = crate::db::Media {
+            title: "Invented Film".to_string(),
+            kind: crate::db::MediaKind::Movie,
+            external_ids: crate::db::ExternalIds {
+                tmdb: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        film.save(&ctx.db)
+            .await
+            .unwrap();
+        let addon = uuid::Uuid::new_v4();
+        crate::db::PreviewSource::store(
+            &ctx.db,
+            film.id,
+            addon,
+            &[crate::db::NewPreviewSource {
+                content_key: "local:small".to_string(),
+                stream_info: crate::stream::StreamInfo {
+                    descriptor: StreamDescriptor::Local(file),
+                    addon_id: Some(addon),
+                    ..Default::default()
+                },
+                probe_data: None,
+            }],
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
+        let id = crate::db::PreviewSource::id_for(film.id, addon, "local:small");
+
+        assert!(
+            crate::db::Media::get_by_id(&ctx.db, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            film.streams(&ctx.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server
+            .get(&format!("/stream/{id}"))
+            .expect_failure()
+            .await
+            .assert_status_not_found();
+        let served = server
+            .get(&format!("/stream/{id}?token={}", stream_link_token(id)))
+            .await;
+        served.assert_status_ok();
+        assert_eq!(
+            served
+                .as_bytes()
+                .as_ref(),
+            b"small release"
         );
     }
 

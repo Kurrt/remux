@@ -45,16 +45,9 @@ pub struct Addon {
     pub probe_on_scan: bool,
     #[sqlx(json)]
     pub service_filter: Vec<String>,
-    /// Make seek previews (trick play) for this addon's streams while the
-    /// server-wide switch is on. On by default.
-    pub trickplay: bool,
-    /// Service IDs or inner addon names to make seek previews for. Empty
-    /// means all of this addon's streams.
-    #[sqlx(json)]
-    pub trickplay_service_filter: Vec<String>,
 }
 
-const ADDON_COLS: &str = "id, name, preset, resources, types, enabled, priority, created_at, updated_at, system, is_default, http_redirect_stream, subtitle_extraction, probe_on_scan, service_filter, trickplay, trickplay_service_filter";
+const ADDON_COLS: &str = "id, name, preset, resources, types, enabled, priority, created_at, updated_at, system, is_default, http_redirect_stream, subtitle_extraction, probe_on_scan, service_filter";
 
 impl Addon {
     pub async fn list(db: &SqlitePool) -> Result<Vec<Self>> {
@@ -79,8 +72,8 @@ impl Addon {
     pub async fn insert(&self, db: &SqlitePool) -> Result<()> {
         sqlx::query(
             "INSERT INTO addons \
-             (id, name, preset, resources, types, enabled, priority, created_at, updated_at, system, is_default, http_redirect_stream, subtitle_extraction, probe_on_scan, service_filter, trickplay, trickplay_service_filter) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             (id, name, preset, resources, types, enabled, priority, created_at, updated_at, system, is_default, http_redirect_stream, subtitle_extraction, probe_on_scan, service_filter) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(self.id)
         .bind(&self.name)
@@ -97,8 +90,6 @@ impl Addon {
         .bind(self.subtitle_extraction)
         .bind(self.probe_on_scan)
         .bind(sqlx::types::Json(&self.service_filter))
-        .bind(self.trickplay)
-        .bind(sqlx::types::Json(&self.trickplay_service_filter))
         .execute(db)
         .await?;
         Ok(())
@@ -110,8 +101,7 @@ impl Addon {
              SET name = ?2, preset = ?3, resources = ?4, types = ?5, \
                  enabled = ?6, priority = ?7, updated_at = ?8, is_default = ?9, \
                  http_redirect_stream = ?10, service_filter = ?11, \
-                 subtitle_extraction = ?12, probe_on_scan = ?13, \
-                 trickplay = ?14, trickplay_service_filter = ?15 \
+                 subtitle_extraction = ?12, probe_on_scan = ?13 \
              WHERE id = ?1",
         )
         .bind(self.id)
@@ -127,8 +117,6 @@ impl Addon {
         .bind(sqlx::types::Json(&self.service_filter))
         .bind(self.subtitle_extraction)
         .bind(self.probe_on_scan)
-        .bind(self.trickplay)
-        .bind(sqlx::types::Json(&self.trickplay_service_filter))
         .execute(db)
         .await?;
         Ok(())

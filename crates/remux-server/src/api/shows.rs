@@ -155,23 +155,16 @@ pub async fn shows_episodes(
     let trickplay = trickplay_cfg
         .as_ref()
         .is_some_and(crate::trickplay::enabled);
-    let trickplay_other = trickplay_cfg
-        .as_ref()
-        .is_some_and(crate::trickplay::other_version);
-    let trickplay_addons = if trickplay {
-        state
-            .ctx
-            .sessions
-            .trickplay
-            .addon_rules()
-    } else {
-        std::sync::Arc::default()
-    };
+    let trickplay_passes = state
+        .ctx
+        .sessions
+        .trickplay
+        .clone();
     let items = get_items(state, session.clone(), q.clone(), true)
         .await?
         .with_permissions()
         .with_client_patches()
-        .with_trickplay(trickplay, trickplay_addons, trickplay_other)
+        .with_trickplay(trickplay, &trickplay_passes)
         .build();
 
     Ok(Json(serde_json::json!({

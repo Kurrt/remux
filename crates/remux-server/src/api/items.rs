@@ -79,14 +79,15 @@ fn apply_permissions(item: &mut api::BaseItemDto, user: &db::User) {
 /// Whether each of `media`'s source rows may get trick play pictures, in the
 /// order its media sources are built. A group (one source standing for several
 /// rows) or a row with no stream information is judged by the item alone.
-/// `addons` is the snapshot of [`crate::trickplay::AddonRule`]s. With `other`
-/// (`TrickplayOtherVersion`), a row its addon says not to read is listed when
-/// another of the rows can be read in its place (see
-/// [`crate::trickplay::other_versions`]).
+/// `addons` is the snapshot of [`crate::trickplay::AddonRule`]s. A row its
+/// addon says not to read is listed when another of the rows can be read in
+/// its place (see [`crate::trickplay::other_versions`]), or, with
+/// `preview_source` (see [`crate::trickplay::preview_source_may_help`]), when
+/// it has a measured length a dedicated addon's file may match.
 fn trickplay_rows_ok(
     media: &db::Media,
     addons: &crate::trickplay::AddonRules,
-    other: bool,
+    preview_source: bool,
 ) -> Vec<bool> {
     let rows = media
         .sources
@@ -103,15 +104,16 @@ fn trickplay_rows_ok(
                         let runtime = crate::trickplay::runtime_s(row, media.runtime);
                         crate::trickplay::eligible_row(row, info, runtime).is_ok()
                             && (crate::trickplay::addon_ok(addons, info)
-                                || (other
-                                    && !crate::trickplay::other_versions(
-                                        row,
-                                        rows,
-                                        media.runtime,
-                                        addons,
-                                        |_| false,
-                                    )
-                                    .is_empty()))
+                                || (preview_source
+                                    && crate::trickplay::measured_ticks(row).is_some())
+                                || !crate::trickplay::other_versions(
+                                    row,
+                                    rows,
+                                    media.runtime,
+                                    addons,
+                                    |_| false,
+                                )
+                                .is_empty())
                     })
         })
         .collect()
@@ -165,7 +167,7 @@ pub struct ItemsQueryResultBuilder {
     fields: Option<Vec<api::ItemFields>>,
     trickplay: bool,
     trickplay_addons: std::sync::Arc<crate::trickplay::AddonRules>,
-    trickplay_other: bool,
+    trickplay_passes: Option<crate::trickplay::TrickplayPasses>,
 }
 
 impl ItemsQueryResultBuilder {
@@ -184,7 +186,7 @@ impl ItemsQueryResultBuilder {
             fields: None,
             trickplay: false,
             trickplay_addons: std::sync::Arc::default(),
-            trickplay_other: false,
+            trickplay_passes: None,
         }
     }
 
@@ -203,7 +205,7 @@ impl ItemsQueryResultBuilder {
             fields: None,
             trickplay: false,
             trickplay_addons: std::sync::Arc::default(),
-            trickplay_other: false,
+            trickplay_passes: None,
         }
     }
 
@@ -239,18 +241,18 @@ impl ItemsQueryResultBuilder {
     }
 
     /// Fill Jellyfin's `Trickplay` field, for a list whose `Fields` asks for it
-    /// while trick play pictures are on. `addons` is the snapshot of
-    /// [`crate::trickplay::AddonRule`]s; `other` is
-    /// [`crate::trickplay::other_version`].
+    /// while trick play pictures are on, judged by the addon rules and the
+    /// asks of addons kept for seek previews only as `passes` holds them.
     pub fn with_trickplay(
         mut self,
         on: bool,
-        addons: std::sync::Arc<crate::trickplay::AddonRules>,
-        other: bool,
+        passes: &crate::trickplay::TrickplayPasses,
     ) -> Self {
         self.trickplay = on;
-        self.trickplay_addons = addons;
-        self.trickplay_other = other;
+        if on {
+            self.trickplay_addons = passes.addon_rules();
+            self.trickplay_passes = Some(passes.clone());
+        }
         self
     }
 
@@ -265,10 +267,20 @@ impl ItemsQueryResultBuilder {
                     let rows_ok = self
                         .trickplay
                         .then(|| {
+                            let preview_source = self
+                                .trickplay_passes
+                                .as_ref()
+                                .is_some_and(|passes| {
+                                    crate::trickplay::preview_source_may_help(
+                                        &self.trickplay_addons,
+                                        passes,
+                                        m.id,
+                                    )
+                                });
                             trickplay_rows_ok(
                                 &m,
                                 &self.trickplay_addons,
-                                self.trickplay_other,
+                                preview_source,
                             )
                         });
                     let mut dto =
@@ -1231,18 +1243,11 @@ pub async fn items(
     let trickplay = trickplay_cfg
         .as_ref()
         .is_some_and(crate::trickplay::enabled);
-    let trickplay_other = trickplay_cfg
-        .as_ref()
-        .is_some_and(crate::trickplay::other_version);
-    let trickplay_addons = if trickplay {
-        state
-            .ctx
-            .sessions
-            .trickplay
-            .addon_rules()
-    } else {
-        std::sync::Arc::default()
-    };
+    let trickplay_passes = state
+        .ctx
+        .sessions
+        .trickplay
+        .clone();
     let items = get_items(state.clone(), session.clone(), q.clone(), true)
         .await?
         .preload_playlist_runtimes(
@@ -1253,7 +1258,7 @@ pub async fn items(
         .await
         .with_permissions()
         .with_client_patches()
-        .with_trickplay(trickplay, trickplay_addons, trickplay_other)
+        .with_trickplay(trickplay, &trickplay_passes)
         .build();
 
     Ok(Json(serde_json::json!({
@@ -2870,15 +2875,15 @@ async fn item_for_user(
     // Jellyfin sends `Trickplay` on every single item; Remux only while its
     // pictures are made, so responses stay unchanged with the switch off.
     if crate::trickplay::enabled(&server_config) {
-        let addons = state
+        let passes = &state
             .ctx
             .sessions
-            .trickplay
-            .addon_rules();
+            .trickplay;
+        let addons = passes.addon_rules();
         let rows_ok = trickplay_rows_ok(
             &media,
             &addons,
-            crate::trickplay::other_version(&server_config),
+            crate::trickplay::preview_source_may_help(&addons, passes, media.id),
         );
         base_item.trickplay = Some(trickplay_manifest(&base_item, &rows_ok));
     }
@@ -9326,10 +9331,10 @@ mod tests {
         assert_visible([true, false, true]).await;
     }
 
-    /// With `TrickplayOtherVersion` on, a source its addon says not to read is
-    /// listed when another source of the title can be read in its place, and
-    /// told its own count; never with the setting off, and never when no
-    /// other source fits.
+    /// A source its addon says not to read is listed when another source of
+    /// the title can be read in its place, and told its own count; never when
+    /// no other source fits, unless an addon kept for seek previews only may
+    /// give a file of its measured length.
     #[test]
     fn trickplay_lists_a_source_not_read_when_another_stands_in() {
         use crate::{
@@ -9340,11 +9345,14 @@ mod tests {
 
         let film_id = Uuid::new_v4();
         let (off_id, on_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let rule = |trickplay: bool| AddonRule {
+        let rule = |reads: bool| AddonRule {
             iptv: false,
             redirect: false,
-            trickplay,
-            service_filter: vec![],
+            reads,
+            preview_only: false,
+            priority: 0,
+            is_default: true,
+            system: false,
         };
         let rules: AddonRules = [(off_id, rule(false)), (on_id, rule(true))]
             .into_iter()
@@ -9390,17 +9398,12 @@ mod tests {
         let fits = film(row(on_id, 7_200, api::ProbeOrigin::Ffprobe, Some(true)));
         assert_eq!(
             super::trickplay_rows_ok(&fits, &rules, false),
-            vec![false, true],
-            "the setting off"
-        );
-        assert_eq!(
-            super::trickplay_rows_ok(&fits, &rules, true),
             vec![true, true]
         );
         let dto = api::db_media_to_item(fits.clone(), false);
         let manifest = super::trickplay_manifest(
             &dto,
-            &super::trickplay_rows_ok(&fits, &rules, true),
+            &super::trickplay_rows_ok(&fits, &rules, false),
         );
         let counts: Vec<i32> = manifest
             .values()
@@ -9427,8 +9430,55 @@ mod tests {
             ),
         ] {
             let title = film(other);
-            assert!(!super::trickplay_rows_ok(&title, &rules, true)[0], "{why}");
+            assert!(!super::trickplay_rows_ok(&title, &rules, false)[0], "{why}");
+            assert!(
+                super::trickplay_rows_ok(&title, &rules, true)[0],
+                "{why}: a dedicated addon may give a file of its length"
+            );
         }
+
+        // A dedicated addon cannot help a source with no measured length.
+        let unmeasured = db::Media {
+            sources: Some(vec![row(
+                off_id,
+                7_200,
+                api::ProbeOrigin::FilenameGuess,
+                Some(true),
+            )]),
+            ..film(row(on_id, 7_200, api::ProbeOrigin::Ffprobe, None))
+        };
+        assert_eq!(
+            super::trickplay_rows_ok(&unmeasured, &rules, true),
+            vec![false]
+        );
+
+        // Once the title's asks of the dedicated addon kept nothing, its
+        // refused source is no longer listed with previews.
+        let dedicated = Uuid::new_v4();
+        let with_dedicated: AddonRules = rules
+            .iter()
+            .map(|(id, rule)| (*id, rule.clone()))
+            .chain([(
+                dedicated,
+                AddonRule {
+                    preview_only: true,
+                    ..rule(true)
+                },
+            )])
+            .collect();
+        let passes = crate::trickplay::TrickplayPasses::new();
+        let title = film(row(on_id, 7_300, api::ProbeOrigin::Ffprobe, Some(true)));
+        let listed = |passes: &crate::trickplay::TrickplayPasses| {
+            let helps = crate::trickplay::preview_source_may_help(
+                &with_dedicated,
+                passes,
+                film_id,
+            );
+            super::trickplay_rows_ok(&title, &with_dedicated, helps)[0]
+        };
+        assert!(listed(&passes), "not asked yet");
+        passes.mark_asked(film_id, dedicated, Some(0));
+        assert!(!listed(&passes), "its last ask kept nothing");
     }
 
     /// A source whose stream row fails the row checks (here a torrent) gets no
@@ -9628,6 +9678,8 @@ mod tests {
         assert_eq!(info["ThumbnailCount"], 720);
     }
 
+    /// An addon's sources are advertised while its "seek previews" resource is
+    /// on, and not once it is off. A new addon has it off.
     #[tokio::test]
     async fn trickplay_leaves_out_sources_of_an_addon_switched_off() {
         use crate::{api, db::Settings};
@@ -9654,6 +9706,15 @@ mod tests {
             }))
             .await
             .json();
+        server
+            .post(&format!("/addons/{}", created.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&serde_json::json!({ "resources": ["stream", "seekPreviews"] }))
+            .await
+            .assert_status_ok();
 
         let mut film = insert_media(
             &ctx.db,
@@ -9780,7 +9841,7 @@ mod tests {
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&auth).unwrap(),
             )
-            .json(&serde_json::json!({ "trickplay": false }))
+            .json(&serde_json::json!({ "resources": ["stream"] }))
             .await
             .assert_status_ok();
         let off = get_item(&server, &auth, film.id).await;
