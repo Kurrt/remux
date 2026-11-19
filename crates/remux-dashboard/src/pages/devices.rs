@@ -326,14 +326,14 @@ pub fn DevicesPage(app_state: AppState) -> Element {
                                 }
                                 match *details_four_k.read() {
                                     FourKSupport::Supported => rsx! {
-                                        p { class: "field-hint device-4k-on", "Counts as 4K: 4K versions are offered first." }
+                                        p { class: "field-hint device-4k-on", "This device has been marked as supporting 4K video." }
                                     },
                                     FourKSupport::Unsupported => rsx! {
-                                        p { class: "field-hint", "Does not count as 4K: 1080p versions are offered first." }
+                                        p { class: "field-hint", "This device has been marked as not supporting 4K video." }
                                     },
                                     FourKSupport::Auto => rsx! {
                                         p { class: "field-hint",
-                                            "Not known yet: counts as 4K once it has played 4K for ten minutes, or if its app says it supports 4K."
+                                            "Not detected yet: a device is marked as supporting 4K video once it has played 4K for ten minutes, or if its app says it supports 4K."
                                         }
                                     },
                                 }
