@@ -257,8 +257,6 @@ pub fn DevicesPage(app_state: AppState) -> Element {
             {
                 let device_id = device.id.clone().unwrap_or_default();
                 let owner_id = device.remux.as_ref().and_then(|r| r.user_id);
-                let counts_4k = device.remux.as_ref().and_then(|r| r.four_k)
-                    == Some(FourKSupport::Supported);
                 let app = match (&device.app_name, &device.app_version) {
                     (Some(app), Some(version)) => format!("{app} {version}"),
                     (Some(app), None) => app.clone(),
@@ -314,25 +312,30 @@ pub fn DevicesPage(app_state: AppState) -> Element {
                                 KvRow { label: "Id", value: device.id.clone().unwrap_or_default() }
                             }
                             FormGroup { label: "4K",
-                                div { class: "device-4k-choice",
-                                    select {
-                                        class: "select-input",
-                                        value: "{details_four_k.read()}",
-                                        onchange: move |event: Event<FormData>| {
-                                            if let Ok(choice) = event.value().parse::<FourKSupport>() {
-                                                details_four_k.set(choice);
-                                            }
-                                        },
-                                        option { value: "Auto", selected: *details_four_k.read() == FourKSupport::Auto, "Auto" }
-                                        option { value: "Supported", selected: *details_four_k.read() == FourKSupport::Supported, "Supports 4K" }
-                                        option { value: "Unsupported", selected: *details_four_k.read() == FourKSupport::Unsupported, "Does not support 4K" }
-                                    }
-                                    if counts_4k {
-                                        span { class: "device-4k", "4K" }
-                                    }
+                                select {
+                                    class: "select-input",
+                                    value: "{details_four_k.read()}",
+                                    onchange: move |event: Event<FormData>| {
+                                        if let Ok(choice) = event.value().parse::<FourKSupport>() {
+                                            details_four_k.set(choice);
+                                        }
+                                    },
+                                    option { value: "Auto", selected: *details_four_k.read() == FourKSupport::Auto, "Auto" }
+                                    option { value: "Supported", selected: *details_four_k.read() == FourKSupport::Supported, "Supports 4K" }
+                                    option { value: "Unsupported", selected: *details_four_k.read() == FourKSupport::Unsupported, "Does not support 4K" }
                                 }
-                                p { class: "field-hint",
-                                    "Auto: a device counts as 4K once it has played 4K for ten minutes, or if its app says it supports 4K."
+                                match *details_four_k.read() {
+                                    FourKSupport::Supported => rsx! {
+                                        p { class: "field-hint device-4k-on", "Counts as 4K: 4K versions are offered first." }
+                                    },
+                                    FourKSupport::Unsupported => rsx! {
+                                        p { class: "field-hint", "Does not count as 4K: 1080p versions are offered first." }
+                                    },
+                                    FourKSupport::Auto => rsx! {
+                                        p { class: "field-hint",
+                                            "Not known yet: counts as 4K once it has played 4K for ten minutes, or if its app says it supports 4K."
+                                        }
+                                    },
                                 }
                             }
                             if let Some(err) = details_error.read().as_ref() {

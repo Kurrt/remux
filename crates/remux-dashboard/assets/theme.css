@@ -409,18 +409,9 @@ html, body {
 .device-col-time   { flex: 0 0 auto; padding: 8px 12px; text-align: right; font-family: var(--font-mono); font-size: .7rem; color: var(--text-dim); white-space: nowrap; }
 .device-col-action { flex: 0 0 auto; padding: 8px 20px 8px 12px; display: flex; align-items: center; gap: 10px; }
 
-.device-4k {
-  font-family: var(--font-mono);
-  font-size: .65rem;
-  font-weight: 600;
-  letter-spacing: .06em;
-  color: var(--success);
-  white-space: nowrap;
-}
+.field-hint.device-4k-on { color: var(--success); }
 
 .device-details .kv-value { text-align: right; overflow-wrap: anywhere; }
-.device-4k-choice { display: flex; align-items: center; gap: 10px; }
-.device-4k-choice .select-input { flex: 1 1 auto; min-width: 0; }
 
 /* Truncate long app version strings (e.g. git-hash builds) */
 .device-col-app .session-client-badge {
