@@ -333,7 +333,7 @@ pub fn DevicesPage(app_state: AppState) -> Element {
                                     },
                                     FourKSupport::Auto => rsx! {
                                         p { class: "field-hint",
-                                            "Not detected yet: a device is marked as supporting 4K video once it has played 4K for ten minutes, or if its app says it supports 4K."
+                                            "Not detected yet. Remux learns 4K support after 10 minutes of actual 4K playback without video transcoding; paused time and skips do not count."
                                         }
                                     },
                                 }
